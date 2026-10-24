@@ -32,6 +32,12 @@ var (
 	ErrInvalidVersion = errors.New("version must be >= -1")
 	ErrLocked         = errors.New("database locked")
 	ErrLockTimeout    = errors.New("timeout: can't acquire database lock")
+
+	// ErrStop is returned when an execution was stopped due to a value
+	// sent on GracefulStop. It is a sentinel error; use errors.Is to
+	// distinguish a stopped execution from a successful one and the
+	// returned error may also be an ErrStopped carrying version state.
+	ErrStop = errors.New("migration stopped")
 )
 
 // ErrShortLimit is an error returned when not enough migrations
@@ -53,6 +59,39 @@ func (e ErrDirty) Error() string {
 	return fmt.Sprintf("Dirty database version %v. Fix and force version.", e.Version)
 }
 
+// ErrStopped is returned by an execution that ended because of a graceful
+// stop request. It records the version table state observed at the time the
+// stop took effect, so callers can tell which version the database stopped
+// at and whether it was left dirty.
+//
+// ErrStopped wraps ErrStop, so errors.Is(err, ErrStop) matches both the
+// plain sentinel (e.g. a stop during the lock wait or a rejected reuse) and
+// an ErrStopped.
+type ErrStopped struct {
+	// Version is the version table version at the time of the stop.
+	// database.NilVersion (-1) means no migration had been applied.
+	Version int
+
+	// Dirty is the dirty flag of the version table at the time of the stop.
+	Dirty bool
+}
+
+func (e ErrStopped) Error() string {
+	switch {
+	case e.Dirty:
+		return fmt.Sprintf("migration stopped at version %v (dirty): inspect the database and force version %v to continue", e.Version, e.Version)
+	case e.Version == database.NilVersion:
+		return "migration stopped before any migration was applied"
+	default:
+		return fmt.Sprintf("migration stopped at version %v (clean)", e.Version)
+	}
+}
+
+// Unwrap returns ErrStop so that errors.Is with ErrStop succeeds.
+func (e ErrStopped) Unwrap() error {
+	return ErrStop
+}
+
 type Migrate struct {
 	sourceName         string
 	sourceDrv          source.Driver
@@ -65,8 +104,15 @@ type Migrate struct {
 	// GracefulStop accepts `true` and will stop executing migrations
 	// as soon as possible at a safe break point, so that the database
 	// is not corrupted.
+	// The channel type and the way a stop is requested (sending `true`)
+	// are kept stable for library callers. After a stop took effect, the
+	// instance is unusable for further executions until ResetGracefulStop
+	// is called; see ErrStop.
 	GracefulStop chan bool
-	isLockedMu   *sync.Mutex
+
+	// stopMu guards isGracefulStop.
+	stopMu     sync.Mutex
+	isLockedMu *sync.Mutex
 
 	isGracefulStop bool
 	isLocked       bool
@@ -210,7 +256,11 @@ func (m *Migrate) Close() (source error, database error) {
 // Migrate looks at the currently active migration version,
 // then migrates either up or down to the specified version.
 func (m *Migrate) Migrate(version uint) error {
-	if err := m.lock(); err != nil {
+	if err := m.checkNotStopped(); err != nil {
+		return err
+	}
+
+	if err := m.lockForRun(); err != nil {
 		return err
 	}
 
@@ -236,7 +286,11 @@ func (m *Migrate) Steps(n int) error {
 		return ErrNoChange
 	}
 
-	if err := m.lock(); err != nil {
+	if err := m.checkNotStopped(); err != nil {
+		return err
+	}
+
+	if err := m.lockForRun(); err != nil {
 		return err
 	}
 
@@ -263,7 +317,11 @@ func (m *Migrate) Steps(n int) error {
 // Up looks at the currently active migration version
 // and will migrate all the way up (applying all up migrations).
 func (m *Migrate) Up() error {
-	if err := m.lock(); err != nil {
+	if err := m.checkNotStopped(); err != nil {
+		return err
+	}
+
+	if err := m.lockForRun(); err != nil {
 		return err
 	}
 
@@ -285,7 +343,11 @@ func (m *Migrate) Up() error {
 // Down looks at the currently active migration version
 // and will migrate all the way down (applying all down migrations).
 func (m *Migrate) Down() error {
-	if err := m.lock(); err != nil {
+	if err := m.checkNotStopped(); err != nil {
+		return err
+	}
+
+	if err := m.lockForRun(); err != nil {
 		return err
 	}
 
@@ -305,7 +367,11 @@ func (m *Migrate) Down() error {
 
 // Drop deletes everything in the database.
 func (m *Migrate) Drop() error {
-	if err := m.lock(); err != nil {
+	if err := m.checkNotStopped(); err != nil {
+		return err
+	}
+
+	if err := m.lockForRun(); err != nil {
 		return err
 	}
 	if err := m.databaseDrv.Drop(); err != nil {
@@ -323,7 +389,11 @@ func (m *Migrate) Run(migration ...*Migration) error {
 		return ErrNoChange
 	}
 
-	if err := m.lock(); err != nil {
+	if err := m.checkNotStopped(); err != nil {
+		return err
+	}
+
+	if err := m.lockForRun(); err != nil {
 		return err
 	}
 
@@ -367,7 +437,11 @@ func (m *Migrate) Force(version int) error {
 		return ErrInvalidVersion
 	}
 
-	if err := m.lock(); err != nil {
+	if err := m.checkNotStopped(); err != nil {
+		return err
+	}
+
+	if err := m.lockForRun(); err != nil {
 		return err
 	}
 
@@ -720,11 +794,15 @@ func (m *Migrate) readDown(from int, limit int, ret chan<- interface{}) {
 // Before running a newly received migration it will check if it's supposed
 // to stop execution because it might have received a stop signal on the
 // GracefulStop channel.
+//
+// A stopped run returns an error wrapping ErrStop (usually an ErrStopped
+// with the current version table state) instead of nil, so that callers
+// can tell a stopped execution apart from a successful one.
 func (m *Migrate) runMigrations(ret <-chan interface{}) error {
 	for r := range ret {
 
 		if m.stop() {
-			return nil
+			return m.stoppedErr()
 		}
 
 		switch r := r.(type) {
@@ -744,6 +822,16 @@ func (m *Migrate) runMigrations(ret <-chan interface{}) error {
 				if err := m.databaseDrv.Run(migr.BufferedBody); err != nil {
 					return err
 				}
+			}
+
+			// If a stop was requested while the statement was in
+			// flight, take effect here at the safe point but keep the
+			// version table dirty at the migration's target version.
+			// The dirty marker (set before Run) is the accounting the
+			// database already has; the report points it out and the
+			// operator must inspect/force before migrating again.
+			if m.stop() {
+				return m.stoppedErr()
 			}
 
 			// set clean state
@@ -768,6 +856,13 @@ func (m *Migrate) runMigrations(ret <-chan interface{}) error {
 			return fmt.Errorf("unknown type: %T with value: %+v", r, r)
 		}
 	}
+
+	// The channel might have been closed by the reader because it saw the
+	// stop request before another migration could be delivered.
+	if m.stop() {
+		return m.stoppedErr()
+	}
+
 	return nil
 }
 
@@ -813,6 +908,9 @@ func (m *Migrate) versionExists(version uint) (result error) {
 // because a stop signal was received on the GracefulStop channel.
 // Calls are cheap and this function is not blocking.
 func (m *Migrate) stop() bool {
+	m.stopMu.Lock()
+	defer m.stopMu.Unlock()
+
 	if m.isGracefulStop {
 		return true
 	}
@@ -824,6 +922,96 @@ func (m *Migrate) stop() bool {
 
 	default:
 		return false
+	}
+}
+
+// setGracefulStop records that a graceful stop took effect without
+// draining another value from the GracefulStop channel. It is used by
+// the stop watcher in lock which already received the channel value.
+func (m *Migrate) setGracefulStop() {
+	m.stopMu.Lock()
+	m.isGracefulStop = true
+	m.stopMu.Unlock()
+}
+
+// ResetGracefulStop clears the graceful stop state so that the instance
+// can be reused for another execution. It also drains a stop value that
+// may still be buffered on the GracefulStop channel.
+//
+// Executions started after a stop took effect and before
+// ResetGracefulStop is called fail immediately with an error wrapping
+// ErrStop instead of silently doing nothing. After the reset the
+// instance behaves like a freshly created one; the GracefulStop channel
+// itself is not replaced, so existing references to it keep working.
+func (m *Migrate) ResetGracefulStop() {
+	m.stopMu.Lock()
+	defer m.stopMu.Unlock()
+
+	m.isGracefulStop = false
+
+	for {
+		select {
+		case <-m.GracefulStop:
+			// drain stale stop values
+		default:
+			return
+		}
+	}
+}
+
+// checkNotStopped fails fast if a previous graceful stop is still in
+// effect, i.e. the instance has not been reset for reuse.
+func (m *Migrate) checkNotStopped() error {
+	if m.stop() {
+		return fmt.Errorf("migrate instance is stopped after a graceful stop request; call ResetGracefulStop before running migrations again: %w", ErrStop)
+	}
+	return nil
+}
+
+// lockForRun locks the database like lock does, but maps a stop observed
+// during the lock wait to the stopped conclusion. No migration or version
+// table write happens in that case.
+func (m *Migrate) lockForRun() error {
+	if err := m.lock(); err != nil {
+		if errors.Is(err, ErrStop) {
+			return m.stoppedErr()
+		}
+		return err
+	}
+	return nil
+}
+
+// stoppedErr builds the distinguishable conclusion for a stopped
+// execution: it reads the current version table state, logs a report
+// (stopped version, dirty flag and next steps) and returns an
+// ErrStopped wrapping ErrStop. If the version table cannot be read,
+// the read error is joined with ErrStop and still matches errors.Is.
+func (m *Migrate) stoppedErr() error {
+	version, dirty, err := m.databaseDrv.Version()
+	if err != nil {
+		m.logErr(fmt.Errorf("failed to read version after stop: %w", err))
+		return errors.Join(ErrStop, fmt.Errorf("read version table after stop: %w", err))
+	}
+
+	m.logStopReport(version, dirty)
+	return ErrStopped{Version: version, Dirty: dirty}
+}
+
+// logStopReport reports the version table state at a stop and explains
+// how to continue.
+func (m *Migrate) logStopReport(version int, dirty bool) {
+	switch {
+	case dirty:
+		m.logPrintf("Migration stopped at version %v; the database is dirty. The migration to version %v was interrupted before it could be marked clean.\n", version, version)
+		m.logPrintf("Next step: inspect the database state, then run 'migrate force %v' once it is safe to clear the dirty flag, and re-run migrate.\n", version)
+
+	case version == database.NilVersion:
+		m.logPrintf("Migration stopped before any migration was applied; the version table holds no version and is not dirty.\n")
+		m.logPrintf("Next step: re-run migrate to start over.\n")
+
+	default:
+		m.logPrintf("Migration stopped at version %v; the database is clean and no partial migration was left behind.\n", version)
+		m.logPrintf("Next step: re-run migrate to continue from version %v.\n", version)
 	}
 }
 
@@ -884,6 +1072,8 @@ func (m *Migrate) newMigration(version uint, targetVersion int) (*Migration, err
 
 // lock is a thread safe helper function to lock the database.
 // It should be called as late as possible when running migrations.
+// A graceful stop observed while waiting for the lock makes lock return
+// ErrStop without acquiring the lock; the version table is not touched.
 func (m *Migrate) lock() error {
 	m.isLockedMu.Lock()
 	defer m.isLockedMu.Unlock()
@@ -898,8 +1088,10 @@ func (m *Migrate) lock() error {
 		done <- true
 	}()
 
-	// use errchan to signal error back to this context
-	errchan := make(chan error, 2)
+	// use errchan to signal error back to this context.
+	// Capacity covers the lock, timeout and stop senders so that none
+	// of them blocks if lock returns before all results are in.
+	errchan := make(chan error, 3)
 
 	// start timeout goroutine
 	timeout := time.After(m.LockTimeout)
@@ -915,6 +1107,17 @@ func (m *Migrate) lock() error {
 		}
 	}()
 
+	// start graceful stop watcher goroutine
+	go func() {
+		select {
+		case <-done:
+			return
+		case <-m.GracefulStop:
+			m.setGracefulStop()
+			errchan <- ErrStop
+		}
+	}()
+
 	// now try to acquire the lock
 	go func() {
 		if err := m.databaseDrv.Lock(); err != nil {
@@ -924,11 +1127,34 @@ func (m *Migrate) lock() error {
 		}
 	}()
 
-	// wait until we either receive ErrLockTimeout or error from Lock operation
+	// wait until we either receive ErrLockTimeout, ErrStop or error from Lock operation
 	err := <-errchan
 	if err == nil {
 		m.isLocked = true
+		return nil
 	}
+
+	if errors.Is(err, ErrStop) {
+		// The stop can win the race against a concurrent successful
+		// lock acquisition. Drain the remaining result of the lock
+		// attempt and release the advisory lock if it was acquired,
+		// so that subsequent runs are not blocked.
+		go func() {
+			for lateErr := range errchan {
+				if lateErr == nil {
+					_ = m.databaseDrv.Unlock()
+					return
+				}
+				if !errors.Is(lateErr, ErrLockTimeout) {
+					// terminal result of the Lock attempt itself
+					return
+				}
+				// ErrLockTimeout fired, but the lock attempt is still
+				// running and can succeed later; keep waiting for it.
+			}
+		}()
+	}
+
 	return err
 }
 

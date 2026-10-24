@@ -2,13 +2,19 @@ package cli
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/golang-migrate/migrate/v4"
+	_ "github.com/golang-migrate/migrate/v4/database/stub"
+	_ "github.com/golang-migrate/migrate/v4/source/stub"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -286,6 +292,97 @@ func TestNumDownFromArgs(t *testing.T) {
 				}
 			} else if c.expectedErrStr != "" {
 				t.Error("Expected error: " + c.expectedErrStr + " but got nil instead")
+			}
+		})
+	}
+}
+
+// TestWatchStopSignals verifies the two-level stop semantics:
+// the first interrupt requests a graceful stop via the GracefulStop
+// channel and does not exit, the second interrupt forces exit with the
+// dedicated, non-zero exit code.
+func TestWatchStopSignals(t *testing.T) {
+	m, err := migrate.New("stub://", "stub://")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if _, err := m.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	signals := make(chan os.Signal, 2)
+	exited := make(chan int, 1)
+	go watchStopSignals(signals, m, func(code int) {
+		exited <- code
+	})
+
+	// first interrupt: graceful stop request only
+	signals <- syscall.SIGINT
+	select {
+	case <-m.GracefulStop:
+	case <-time.After(time.Second):
+		t.Fatal("first signal did not request a graceful stop")
+	}
+	select {
+	case code := <-exited:
+		t.Fatalf("first signal must not exit the process, got exit code %d", code)
+	default:
+	}
+
+	// second interrupt: forced exit with the dedicated exit code
+	signals <- syscall.SIGINT
+	select {
+	case code := <-exited:
+		if code != exitCodeStopped {
+			t.Fatalf("expected forced exit code %d, got %d", exitCodeStopped, code)
+		}
+		if code == 0 || code == 1 {
+			t.Fatalf("stopped exit code must be distinguishable from success (0) and failure (1), got %d", code)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second signal did not force an exit")
+	}
+}
+
+// TestFatalErrExitCodes verifies in subprocesses that fatalErr maps a
+// stopped conclusion to the dedicated exit code, while ordinary failures
+// still exit with 1.
+func TestFatalErrExitCodes(t *testing.T) {
+	cases := []struct {
+		name     string
+		envValue string
+		err      error
+		wantCode int
+	}{
+		{"stopped", "stopped", fmt.Errorf("wrapped: %w", migrate.ErrStop), exitCodeStopped},
+		{"generic failure", "generic", errors.New("boom"), 1},
+	}
+
+	// child process: terminate via fatalErr with the selected error
+	if envValue := os.Getenv("MIGRATE_TEST_FATAL_ERR"); envValue != "" {
+		for _, c := range cases {
+			if c.envValue == envValue {
+				(&Log{}).fatalErr(c.err)
+				return
+			}
+		}
+		t.Fatalf("unknown MIGRATE_TEST_FATAL_ERR value %q", envValue)
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=^TestFatalErrExitCodes$")
+			cmd.Env = append(os.Environ(), "MIGRATE_TEST_FATAL_ERR="+c.envValue)
+			err := cmd.Run()
+
+			exitErr, ok := err.(*exec.ExitError)
+			if !ok {
+				t.Fatalf("expected process to exit non-zero, got %v", err)
+			}
+			if exitErr.ExitCode() != c.wantCode {
+				t.Fatalf("expected exit code %d, got %d", c.wantCode, exitErr.ExitCode())
 			}
 		})
 	}

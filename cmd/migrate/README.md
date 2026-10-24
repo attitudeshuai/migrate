@@ -116,7 +116,11 @@ $ migrate -source github://mattes:personal-access-token@mattes/migrate_test \
 ```
 
 The CLI will gracefully stop at a safe point when SIGINT (ctrl+c) is received.
-Send SIGKILL for immediate halt.
+A second SIGINT forces an immediate exit; both the forced exit and a completed
+graceful stop terminate the process with the dedicated exit code 5, which is
+distinct from success (0) and failure (1). The stopped run reports the version
+table state it ended at (version and dirty flag) and how to continue.
+Send SIGKILL for immediate halt without any reporting.
 
 ## Reading CLI arguments from somewhere else
 

@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/golang-migrate/migrate/v4/database"
 	dStub "github.com/golang-migrate/migrate/v4/database/stub"
 	"github.com/golang-migrate/migrate/v4/source"
 	sStub "github.com/golang-migrate/migrate/v4/source/stub"
@@ -1407,5 +1411,379 @@ func equalDbSeq(t *testing.T, i int, expected migrationSequence, got *dStub.Stub
 	bs := expected.bodySequence()
 	if !got.EqualSequence(bs) {
 		t.Fatalf("\nexpected sequence %v,\ngot               %v, in %v", bs, got.MigrationSequence, i)
+	}
+}
+
+// captureLogger records everything printed through the migrate Logger.
+type captureLogger struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *captureLogger) Printf(format string, v ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	fmt.Fprintf(&l.buf, format, v...)
+}
+
+func (l *captureLogger) Verbose() bool { return false }
+
+func (l *captureLogger) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+func newMigrateWithDB(t *testing.T, dbDrv database.Driver) *Migrate {
+	t.Helper()
+	m, err := NewWithDatabaseInstance("stub://", dbDrvNameStub, dbDrv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.sourceDrv.(*sStub.Stub).Migrations = sourceStubMigrations
+	return m
+}
+
+// blockingRunDriver blocks the first Run call in releaseRun until closed,
+// simulating a long-running migration statement.
+type blockingRunDriver struct {
+	*dStub.Stub
+	runStarted chan struct{}
+	releaseRun chan struct{}
+	startOnce  sync.Once
+}
+
+func (d *blockingRunDriver) Run(migration io.Reader) error {
+	d.startOnce.Do(func() { close(d.runStarted) })
+	<-d.releaseRun
+	return d.Stub.Run(migration)
+}
+
+// stopAfterCleanDriver requests a graceful stop the moment the given
+// version is marked clean, simulating a stop in the safe gap between
+// migrations.
+type stopAfterCleanDriver struct {
+	*dStub.Stub
+	gracefulStop chan<- bool
+	stopVersion  int
+	stopOnce     sync.Once
+}
+
+func (d *stopAfterCleanDriver) SetVersion(version int, dirty bool) error {
+	if err := d.Stub.SetVersion(version, dirty); err != nil {
+		return err
+	}
+	if !dirty && version == d.stopVersion {
+		d.stopOnce.Do(func() { d.gracefulStop <- true })
+	}
+	return nil
+}
+
+// blockingLockDriver blocks Lock until releaseLock is closed, simulating
+// a wait for a database lock held by another process.
+type blockingLockDriver struct {
+	*dStub.Stub
+	lockStarted  chan struct{}
+	releaseLock  chan struct{}
+	lockAcquired chan struct{}
+	lockReleased chan struct{}
+	startOnce    sync.Once
+	acquireOnce  sync.Once
+	releaseOnce  sync.Once
+}
+
+func (d *blockingLockDriver) Lock() error {
+	d.startOnce.Do(func() { close(d.lockStarted) })
+	<-d.releaseLock
+	if err := d.Stub.Lock(); err != nil {
+		return err
+	}
+	d.acquireOnce.Do(func() { close(d.lockAcquired) })
+	return nil
+}
+
+func (d *blockingLockDriver) Unlock() error {
+	err := d.Stub.Unlock()
+	if err == nil {
+		d.releaseOnce.Do(func() { close(d.lockReleased) })
+	}
+	return err
+}
+
+func waitErr(t *testing.T, ch <-chan error, msg string) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal(msg)
+		return nil
+	}
+}
+
+func assertStoppedAt(t *testing.T, err error, version int, dirty bool) ErrStopped {
+	t.Helper()
+	if !errors.Is(err, ErrStop) {
+		t.Fatalf("expected errors.Is(err, ErrStop), got %v", err)
+	}
+	var stopped ErrStopped
+	if !errors.As(err, &stopped) {
+		t.Fatalf("expected ErrStopped, got %T (%v)", err, err)
+	}
+	if stopped.Version != version || stopped.Dirty != dirty {
+		t.Fatalf("expected stopped at version %v dirty %v, got version %v dirty %v",
+			version, dirty, stopped.Version, stopped.Dirty)
+	}
+	return stopped
+}
+
+// A stop arriving while a statement is running waits for the statement to
+// finish at the safe point, keeps the version table dirty at that version
+// and returns a distinguishable stopped conclusion.
+func TestGracefulStopDuringStatement(t *testing.T) {
+	dbInst, err := dStub.WithInstance(&DummyInstance{"database"}, &dStub.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := &blockingRunDriver{
+		Stub:       dbInst.(*dStub.Stub),
+		runStarted: make(chan struct{}),
+		releaseRun: make(chan struct{}),
+	}
+	m := newMigrateWithDB(t, db)
+	logger := &captureLogger{}
+	m.Log = logger
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- m.Up() }()
+
+	select {
+	case <-db.runStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("migration statement never started")
+	}
+
+	// request graceful stop while the statement is in flight
+	m.GracefulStop <- true
+	close(db.releaseRun)
+
+	err = waitErr(t, errCh, "Up did not return after graceful stop")
+	assertStoppedAt(t, err, 1, true)
+
+	// version table stays dirty at the interrupted version
+	v, dirty, err := db.Version()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != 1 || !dirty {
+		t.Fatalf("expected version 1 dirty, got version %v dirty %v", v, dirty)
+	}
+	if !db.EqualSequence([]string{"CREATE 1"}) {
+		t.Fatalf("expected only CREATE 1 to run, got %v", db.MigrationSequence)
+	}
+
+	// report explains version, dirty state and next steps
+	report := logger.String()
+	if !strings.Contains(report, "version 1") || !strings.Contains(report, "dirty") {
+		t.Fatalf("report should point out version 1 dirty state, got: %q", report)
+	}
+	if !strings.Contains(report, "force 1") {
+		t.Fatalf("report should explain how to continue (force 1), got: %q", report)
+	}
+}
+
+// A stop in the safe gap between migrations leaves the previous version
+// clean and returns a distinguishable stopped conclusion.
+func TestGracefulStopBetweenMigrations(t *testing.T) {
+	dbInst, err := dStub.WithInstance(&DummyInstance{"database"}, &dStub.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := &stopAfterCleanDriver{
+		Stub:        dbInst.(*dStub.Stub),
+		stopVersion: 1,
+	}
+	m := newMigrateWithDB(t, db)
+	logger := &captureLogger{}
+	m.Log = logger
+	db.gracefulStop = m.GracefulStop
+
+	err = m.Up()
+	assertStoppedAt(t, err, 1, false)
+
+	v, dirty, err := db.Version()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != 1 || dirty {
+		t.Fatalf("expected version 1 clean, got version %v dirty %v", v, dirty)
+	}
+	if !db.EqualSequence([]string{"CREATE 1"}) {
+		t.Fatalf("expected only CREATE 1 to run, got %v", db.MigrationSequence)
+	}
+	report := logger.String()
+	if !strings.Contains(report, "version 1") || !strings.Contains(report, "clean") {
+		t.Fatalf("report should point out version 1 clean state, got: %q", report)
+	}
+}
+
+// A stop during the lock wait returns promptly, never writes the version
+// table and does not run statements; after releasing the lock and
+// resetting the stop, the same instance migrates normally.
+func TestGracefulStopDuringLockWait(t *testing.T) {
+	dbInst, err := dStub.WithInstance(&DummyInstance{"database"}, &dStub.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := &blockingLockDriver{
+		Stub:         dbInst.(*dStub.Stub),
+		lockStarted:  make(chan struct{}),
+		releaseLock:  make(chan struct{}),
+		lockAcquired: make(chan struct{}),
+		lockReleased: make(chan struct{}),
+	}
+	m := newMigrateWithDB(t, db)
+	m.LockTimeout = 30 * time.Second
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- m.Up() }()
+
+	select {
+	case <-db.lockStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("lock attempt never started")
+	}
+
+	m.GracefulStop <- true
+
+	err = waitErr(t, errCh, "Up did not return while waiting for the lock")
+	assertStoppedAt(t, err, database.NilVersion, false)
+
+	// lock-wait stop must not write the version table nor run statements
+	v, dirty, err := db.Version()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != database.NilVersion || dirty {
+		t.Fatalf("expected untouched version table, got version %v dirty %v", v, dirty)
+	}
+	if len(db.MigrationSequence) != 0 {
+		t.Fatalf("expected no statements to run, got %v", db.MigrationSequence)
+	}
+
+	// once the lock becomes available, the reaper must release it so a
+	// reset instance can acquire the lock again
+	close(db.releaseLock)
+	select {
+	case <-db.lockAcquired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocked lock attempt did not complete after release")
+	}
+	select {
+	case <-db.lockReleased:
+	case <-time.After(5 * time.Second):
+		t.Fatal("acquired database lock was not released after stop")
+	}
+
+	// reset and reuse the very same instance
+	m.ResetGracefulStop()
+	if err := m.Up(); err != nil {
+		t.Fatalf("Up after reset failed: %v", err)
+	}
+	v, dirty, err = db.Version()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != 7 || dirty {
+		t.Fatalf("expected version 7 clean after reset, got version %v dirty %v", v, dirty)
+	}
+}
+
+// After a stop took effect, executions fail fast with an explanatory
+// error instead of silently idling; ResetGracefulStop restores the
+// instance and must not replace the GracefulStop channel.
+func TestReuseRejectedBeforeResetAndWorksAfterReset(t *testing.T) {
+	dbInst, err := dStub.WithInstance(&DummyInstance{"database"}, &dStub.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := &blockingRunDriver{
+		Stub:       dbInst.(*dStub.Stub),
+		runStarted: make(chan struct{}),
+		releaseRun: make(chan struct{}),
+	}
+	m := newMigrateWithDB(t, db)
+
+	gracefulStopCh := m.GracefulStop
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- m.Up() }()
+
+	select {
+	case <-db.runStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("migration statement never started")
+	}
+	m.GracefulStop <- true
+	close(db.releaseRun)
+	if err := waitErr(t, errCh, "Up did not return after graceful stop"); !errors.Is(err, ErrStop) {
+		t.Fatalf("expected ErrStop, got %v", err)
+	}
+
+	// executions before reset fail immediately and explain why
+	err = m.Up()
+	if !errors.Is(err, ErrStop) {
+		t.Fatalf("expected reuse without reset to fail with ErrStop, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "ResetGracefulStop") {
+		t.Fatalf("expected error to mention ResetGracefulStop, got %v", err)
+	}
+	if err := m.Force(1); !errors.Is(err, ErrStop) {
+		t.Fatalf("expected Force without reset to fail with ErrStop, got %v", err)
+	}
+	if !db.EqualSequence([]string{"CREATE 1"}) {
+		t.Fatalf("rejected reuse must not run statements, got %v", db.MigrationSequence)
+	}
+
+	// reset restores the instance; the channel itself is preserved
+	m.ResetGracefulStop()
+	if m.GracefulStop != gracefulStopCh {
+		t.Fatal("ResetGracefulStop must not replace the GracefulStop channel")
+	}
+	// the stopped statement was deliberately left dirty at version 1;
+	// acknowledge it (force) as recommended by the stop report, then continue
+	if err := m.Force(1); err != nil {
+		t.Fatalf("Force after reset failed: %v", err)
+	}
+	if err := m.Up(); err != nil {
+		t.Fatalf("Up after reset failed: %v", err)
+	}
+	v, dirty, err := db.Version()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != 7 || dirty {
+		t.Fatalf("expected version 7 clean after reset, got version %v dirty %v", v, dirty)
+	}
+}
+
+// A stop value that is merely buffered and never consumed is cleared by
+// ResetGracefulStop, after which executions work normally.
+func TestResetDrainsUnconsumedStop(t *testing.T) {
+	m, _ := New("stub://", "stub://")
+	m.sourceDrv.(*sStub.Stub).Migrations = sourceStubMigrations
+
+	m.GracefulStop <- true
+	m.ResetGracefulStop()
+
+	if err := m.Up(); err != nil {
+		t.Fatalf("Up after draining reset failed: %v", err)
+	}
+	v, dirty, err := m.Version()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != 7 || dirty {
+		t.Fatalf("expected version 7 clean, got version %v dirty %v", v, dirty)
 	}
 }

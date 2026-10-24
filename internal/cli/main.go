@@ -138,13 +138,7 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 		// handle Ctrl+c
 		signals := make(chan os.Signal, 1)
 		signal.Notify(signals, syscall.SIGINT)
-		go func() {
-			for range signals {
-				log.Println("Stopping after this running migration ...")
-				migrater.GracefulStop <- true
-				return
-			}
-		}()
+		go watchStopSignals(signals, migrater, os.Exit)
 	}
 
 	startTime := time.Now()
@@ -374,4 +368,21 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 	default:
 		printUsageAndExit()
 	}
+}
+
+// watchStopSignals implements the two-level stop semantics:
+// the first interrupt requests a graceful stop and the current
+// migration is allowed to finish up to a safe point; the second
+// interrupt terminates the process immediately with exitCodeStopped.
+//
+// The way the graceful stop is requested (sending true on the
+// GracefulStop channel) is unchanged. exit is injectable for tests.
+func watchStopSignals(signals <-chan os.Signal, migrater *migrate.Migrate, exit func(int)) {
+	<-signals
+	log.Println("Stopping after this running migration ...")
+	migrater.GracefulStop <- true
+
+	<-signals
+	log.Println("Received second interrupt; forcing immediate exit ...")
+	exit(exitCodeStopped)
 }
