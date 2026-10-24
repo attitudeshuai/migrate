@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 )
 
@@ -37,9 +38,9 @@ type Migration struct {
 	// BufferSize defaults to DefaultBufferSize
 	BufferSize uint
 
-	// bufferWriter holds an io.WriteCloser and pipes to BufferBody.
+	// bufferWriter holds an *io.PipeWriter and pipes to BufferBody.
 	// It's an *Closer for flow control.
-	bufferWriter io.WriteCloser
+	bufferWriter *io.PipeWriter
 
 	// Scheduled is the time when the migration was scheduled/ queued.
 	Scheduled time.Time
@@ -55,6 +56,20 @@ type Migration struct {
 
 	// BytesRead holds the number of Bytes read from the migration source.
 	BytesRead int64
+
+	// bufferErr holds the StageBuffer error of the background Buffer
+	// goroutine, attributed to this migration. It is set before the
+	// bufferWriter is closed, so a Run failure unblocked by that close can
+	// observe the original buffer cause.
+	bufferErr error
+
+	// bufferErrMu guards bufferErr.
+	bufferErrMu sync.Mutex
+
+	// bufferWG tracks the background Buffer goroutine. It allows collecting
+	// a late buffer error (e.g. from closing Body) after Run drained the
+	// whole BufferedBody successfully.
+	bufferWG sync.WaitGroup
 }
 
 // NewMigration returns a new Migration and sets the body, identifier,
@@ -100,6 +115,7 @@ func NewMigration(body io.ReadCloser, identifier string,
 	m.BufferSize = DefaultBufferSize
 	m.BufferedBody = br
 	m.bufferWriter = bw
+	m.bufferWG.Add(1) // released once Buffer finishes; see bufferedErr
 	return m, nil
 }
 
@@ -119,6 +135,11 @@ func (m *Migration) LogString() string {
 
 // Buffer buffers Body up to BufferSize.
 // Calling this function blocks. Call with goroutine.
+//
+// Any failure is attributed to this migration (version, direction,
+// identifier) as StageBuffer, stored on the Migration and propagated to
+// readers of BufferedBody, so it is neither lost nor reported against an
+// adjacent migration.
 func (m *Migration) Buffer() (berr error) {
 	if m.Body == nil {
 		return nil
@@ -130,17 +151,26 @@ func (m *Migration) Buffer() (berr error) {
 
 	// defer closing buffer writer and body.
 	defer func() {
+		// Record the failure before closing bufferWriter: the close unblocks
+		// a Run reading BufferedBody, and Run must be able to observe the
+		// original buffer failure rather than the read error it causes.
+		m.setBufferErr(berr)
+
 		// close bufferWriter so Buffer knows that there is no
-		// more data coming.
-		if err := m.bufferWriter.Close(); err != nil {
+		// more data coming; propagate berr so a truncated migration is
+		// never executed silently.
+		if err := m.bufferWriter.CloseWithError(berr); err != nil {
 			berr = errors.Join(berr, err)
+			m.setBufferErr(berr)
 		}
 
 		// it's safe to close the Body too.
 		if err := m.Body.Close(); err != nil {
 			berr = errors.Join(berr, err)
+			m.setBufferErr(berr)
 		}
 
+		m.bufferWG.Done()
 	}()
 
 	// start reading from body, peek won't move the read pointer though
@@ -162,4 +192,29 @@ func (m *Migration) Buffer() (berr error) {
 	m.BytesRead = n
 
 	return nil
+}
+
+// setBufferErr stores the attributed StageBuffer error on the Migration.
+// A nil err is ignored.
+func (m *Migration) setBufferErr(err error) {
+	if err == nil {
+		return
+	}
+	m.bufferErrMu.Lock()
+	m.bufferErr = m.fail(StageBuffer, err)
+	m.bufferErrMu.Unlock()
+}
+
+// bufferedErr returns the attributed buffer failure, if any. When wait is
+// true it waits for the background Buffer goroutine to finish; this is only
+// safe after Run drained the whole BufferedBody. When wait is false it can
+// be used right after a failed Run, where the Buffer goroutine may still be
+// blocked writing the unread tail.
+func (m *Migration) bufferedErr(wait bool) error {
+	if wait {
+		m.bufferWG.Wait()
+	}
+	m.bufferErrMu.Lock()
+	defer m.bufferErrMu.Unlock()
+	return m.bufferErr
 }

@@ -348,11 +348,7 @@ func (m *Migrate) Run(migration ...*Migration) error {
 			}
 
 			ret <- migr
-			go func(migr *Migration) {
-				if err := migr.Buffer(); err != nil {
-					m.logErr(err)
-				}
-			}(migr)
+			go migr.Buffer()
 		}
 	}()
 
@@ -400,9 +396,14 @@ func (m *Migrate) Version() (version uint, dirty bool, err error) {
 func (m *Migrate) read(from int, to int, ret chan<- interface{}) {
 	defer close(ret)
 
+	direction := source.Up
+	if from > to {
+		direction = source.Down
+	}
+
 	// check if from version exists
 	if from >= 0 {
-		if err := m.versionExists(suint(from)); err != nil {
+		if err := m.versionExists(suint(from), direction); err != nil {
 			ret <- err
 			return
 		}
@@ -410,7 +411,7 @@ func (m *Migrate) read(from int, to int, ret chan<- interface{}) {
 
 	// check if to version exists
 	if to >= 0 {
-		if err := m.versionExists(suint(to)); err != nil {
+		if err := m.versionExists(suint(to), direction); err != nil {
 			ret <- err
 			return
 		}
@@ -428,7 +429,7 @@ func (m *Migrate) read(from int, to int, ret chan<- interface{}) {
 		if from == -1 {
 			firstVersion, err := m.sourceDrv.First()
 			if err != nil {
-				ret <- err
+				ret <- wrapReadError(direction, 0, "", err)
 				return
 			}
 
@@ -439,11 +440,7 @@ func (m *Migrate) read(from int, to int, ret chan<- interface{}) {
 			}
 
 			ret <- migr
-			go func() {
-				if err := migr.Buffer(); err != nil {
-					m.logErr(err)
-				}
-			}()
+			go migr.Buffer()
 
 			from = int(firstVersion)
 		}
@@ -456,7 +453,7 @@ func (m *Migrate) read(from int, to int, ret chan<- interface{}) {
 
 			next, err := m.sourceDrv.Next(suint(from))
 			if err != nil {
-				ret <- err
+				ret <- wrapReadError(direction, 0, "", err)
 				return
 			}
 
@@ -467,11 +464,7 @@ func (m *Migrate) read(from int, to int, ret chan<- interface{}) {
 			}
 
 			ret <- migr
-			go func() {
-				if err := migr.Buffer(); err != nil {
-					m.logErr(err)
-				}
-			}()
+			go migr.Buffer()
 
 			from = int(next)
 		}
@@ -493,16 +486,12 @@ func (m *Migrate) read(from int, to int, ret chan<- interface{}) {
 					return
 				}
 				ret <- migr
-				go func() {
-					if err := migr.Buffer(); err != nil {
-						m.logErr(err)
-					}
-				}()
+				go migr.Buffer()
 
 				return
 
 			} else if err != nil {
-				ret <- err
+				ret <- wrapReadError(direction, 0, "", err)
 				return
 			}
 
@@ -513,11 +502,7 @@ func (m *Migrate) read(from int, to int, ret chan<- interface{}) {
 			}
 
 			ret <- migr
-			go func() {
-				if err := migr.Buffer(); err != nil {
-					m.logErr(err)
-				}
-			}()
+			go migr.Buffer()
 
 			from = int(prev)
 		}
@@ -534,7 +519,7 @@ func (m *Migrate) readUp(from int, limit int, ret chan<- interface{}) {
 
 	// check if from version exists
 	if from >= 0 {
-		if err := m.versionExists(suint(from)); err != nil {
+		if err := m.versionExists(suint(from), source.Up); err != nil {
 			ret <- err
 			return
 		}
@@ -555,7 +540,7 @@ func (m *Migrate) readUp(from int, limit int, ret chan<- interface{}) {
 		if from == -1 {
 			firstVersion, err := m.sourceDrv.First()
 			if err != nil {
-				ret <- err
+				ret <- wrapReadError(source.Up, 0, "", err)
 				return
 			}
 
@@ -566,11 +551,7 @@ func (m *Migrate) readUp(from int, limit int, ret chan<- interface{}) {
 			}
 
 			ret <- migr
-			go func() {
-				if err := migr.Buffer(); err != nil {
-					m.logErr(err)
-				}
-			}()
+			go migr.Buffer()
 			from = int(firstVersion)
 			count++
 			continue
@@ -603,7 +584,7 @@ func (m *Migrate) readUp(from int, limit int, ret chan<- interface{}) {
 			}
 		}
 		if err != nil {
-			ret <- err
+			ret <- wrapReadError(source.Up, 0, "", err)
 			return
 		}
 
@@ -614,11 +595,7 @@ func (m *Migrate) readUp(from int, limit int, ret chan<- interface{}) {
 		}
 
 		ret <- migr
-		go func() {
-			if err := migr.Buffer(); err != nil {
-				m.logErr(err)
-			}
-		}()
+		go migr.Buffer()
 		from = int(next)
 		count++
 	}
@@ -634,7 +611,7 @@ func (m *Migrate) readDown(from int, limit int, ret chan<- interface{}) {
 
 	// check if from version exists
 	if from >= 0 {
-		if err := m.versionExists(suint(from)); err != nil {
+		if err := m.versionExists(suint(from), source.Down); err != nil {
 			ret <- err
 			return
 		}
@@ -669,7 +646,7 @@ func (m *Migrate) readDown(from int, limit int, ret chan<- interface{}) {
 			if limit == -1 || limit-count > 0 {
 				firstVersion, err := m.sourceDrv.First()
 				if err != nil {
-					ret <- err
+					ret <- wrapReadError(source.Down, 0, "", err)
 					return
 				}
 
@@ -679,11 +656,7 @@ func (m *Migrate) readDown(from int, limit int, ret chan<- interface{}) {
 					return
 				}
 				ret <- migr
-				go func() {
-					if err := migr.Buffer(); err != nil {
-						m.logErr(err)
-					}
-				}()
+				go migr.Buffer()
 				count++
 			}
 
@@ -693,7 +666,7 @@ func (m *Migrate) readDown(from int, limit int, ret chan<- interface{}) {
 			return
 		}
 		if err != nil {
-			ret <- err
+			ret <- wrapReadError(source.Down, 0, "", err)
 			return
 		}
 
@@ -704,11 +677,7 @@ func (m *Migrate) readDown(from int, limit int, ret chan<- interface{}) {
 		}
 
 		ret <- migr
-		go func() {
-			if err := migr.Buffer(); err != nil {
-				m.logErr(err)
-			}
-		}()
+		go migr.Buffer()
 		from = int(prev)
 		count++
 	}
@@ -736,19 +705,40 @@ func (m *Migrate) runMigrations(ret <-chan interface{}) error {
 
 			// set version with dirty state
 			if err := m.databaseDrv.SetVersion(migr.TargetVersion, true); err != nil {
-				return err
+				return migr.fail(StageSetVersion, err)
 			}
 
 			if migr.Body != nil {
 				m.logVerbosePrintf("Read and execute %v\n", migr.LogString())
-				if err := m.databaseDrv.Run(migr.BufferedBody); err != nil {
-					return err
+
+				// frame reads at statement boundaries so a failure can be
+				// attributed to the failing statement of a multi-statement
+				// migration on top of the driver's own line information
+				stmtReader := newStatementReader(migr.BufferedBody)
+				runErr := m.databaseDrv.Run(stmtReader)
+
+				if runErr != nil {
+					// Run failed while the background Buffer goroutine may
+					// still be blocked writing the unread tail; don't wait
+					// for it, but prefer a buffer failure attributed to this
+					// migration over the pipe read error observed by Run.
+					if berr := migr.bufferedErr(false); berr != nil {
+						return berr
+					}
+					return migr.executeError(runErr, stmtReader.statementsDelivered())
+				}
+
+				// Run drained the whole body, so Buffer has finished closing
+				// the pipe; wait for it to surface a late error (e.g. from
+				// closing the source body).
+				if berr := migr.bufferedErr(true); berr != nil {
+					return berr
 				}
 			}
 
 			// set clean state
 			if err := m.databaseDrv.SetVersion(migr.TargetVersion, false); err != nil {
-				return err
+				return migr.fail(StageSetVersion, err)
 			}
 
 			endTime := time.Now()
@@ -772,8 +762,10 @@ func (m *Migrate) runMigrations(ret <-chan interface{}) error {
 }
 
 // versionExists checks the source if either the up or down migration for
-// the specified migration version exists.
-func (m *Migrate) versionExists(version uint) (result error) {
+// the specified migration version exists. Failures other than the
+// control-flow os.ErrNotExist are attributed to StageRead with the given
+// migration direction.
+func (m *Migrate) versionExists(version uint, direction source.Direction) (result error) {
 	// try up migration first
 	up, _, err := m.sourceDrv.ReadUp(version)
 	if err == nil {
@@ -786,7 +778,7 @@ func (m *Migrate) versionExists(version uint) (result error) {
 	if errors.Is(err, os.ErrExist) {
 		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
+		return wrapReadError(direction, version, "", err)
 	}
 
 	// then try down migration
@@ -801,7 +793,7 @@ func (m *Migrate) versionExists(version uint) (result error) {
 	if errors.Is(err, os.ErrExist) {
 		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
+		return wrapReadError(direction, version, "", err)
 	}
 
 	err = fmt.Errorf("no migration found for version %d: %w", version, err)
@@ -832,6 +824,8 @@ func (m *Migrate) stop() bool {
 func (m *Migrate) newMigration(version uint, targetVersion int) (*Migration, error) {
 	var migr *Migration
 
+	direction := directionFor(version, targetVersion)
+
 	if targetVersion >= int(version) {
 		r, identifier, err := m.sourceDrv.ReadUp(version)
 		if errors.Is(err, os.ErrNotExist) {
@@ -842,7 +836,7 @@ func (m *Migrate) newMigration(version uint, targetVersion int) (*Migration, err
 			}
 
 		} else if err != nil {
-			return nil, err
+			return nil, wrapReadError(direction, version, "", err)
 
 		} else {
 			// create migration from up source
@@ -862,7 +856,7 @@ func (m *Migrate) newMigration(version uint, targetVersion int) (*Migration, err
 			}
 
 		} else if err != nil {
-			return nil, err
+			return nil, wrapReadError(direction, version, "", err)
 
 		} else {
 			// create migration from down source

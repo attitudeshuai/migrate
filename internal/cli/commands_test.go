@@ -2,6 +2,7 @@ package cli
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -9,6 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database"
+	"github.com/golang-migrate/migrate/v4/source"
+	sStub "github.com/golang-migrate/migrate/v4/source/stub"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -288,5 +293,73 @@ func TestNumDownFromArgs(t *testing.T) {
 				t.Error("Expected error: " + c.expectedErrStr + " but got nil instead")
 			}
 		})
+	}
+}
+
+var errCLIFailingDriver = errors.New("cli execute boom")
+
+// cliFailingDriver fails every Run with a database.Error, like a real driver.
+type cliFailingDriver struct {
+	version int
+}
+
+func (cliFailingDriver) Open(string) (database.Driver, error) { return cliFailingDriver{}, nil }
+func (cliFailingDriver) Close() error                         { return nil }
+func (cliFailingDriver) Lock() error                          { return nil }
+func (cliFailingDriver) Unlock() error                        { return nil }
+func (cliFailingDriver) Drop() error                          { return nil }
+func (d cliFailingDriver) Version() (int, bool, error)        { return d.version, false, nil }
+func (cliFailingDriver) SetVersion(int, bool) error           { return nil }
+
+func (cliFailingDriver) Run(io.Reader) error {
+	return database.Error{
+		OrigErr: errCLIFailingDriver,
+		Err:     "migration failed",
+		Query:   []byte("CREATE TABLEE boom"),
+		Line:    7,
+	}
+}
+
+// TestUpCmdFailureScene verifies the CLI command layer receives the unified
+// scene information (version, direction, identifier, stage) rendered ahead of
+// the unchanged driver error text, which is what fatalErr prints verbatim.
+func TestUpCmdFailureScene(t *testing.T) {
+	sourceDrv, err := sStub.WithInstance(nil, &sStub.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceDrv.(*sStub.Stub).Migrations.Append(&source.Migration{
+		Version:    1,
+		Direction:  source.Up,
+		Identifier: "CREATE 1",
+	})
+
+	m, err := migrate.NewWithInstance("stub", sourceDrv, "cli-failing", &cliFailingDriver{version: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = upCmd(m, 1)
+	if err == nil {
+		t.Fatal("expected up command to fail")
+	}
+
+	var me *migrate.MigrationError
+	if !errors.As(err, &me) {
+		t.Fatalf("expected *migrate.MigrationError, got %T: %v", err, err)
+	}
+	if me.Stage != migrate.StageExecute {
+		t.Errorf("expected execute stage, got %q", me.Stage)
+	}
+	if me.Version != 1 || me.Direction != source.Up || me.Identifier != "1.up.stub" {
+		t.Errorf("unexpected scene: v%v %s %q", me.Version, me.Direction, me.Identifier)
+	}
+
+	// This is the exact string the CLI prints via log.fatalErr("error:", err).
+	text := err.Error()
+	for _, want := range []string{"migration v1 up", `"1.up.stub"`, "failed at execute", "in line 7", "cli execute boom"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("expected CLI error text to contain %q, got %q", want, text)
+		}
 	}
 }
