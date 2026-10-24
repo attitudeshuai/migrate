@@ -65,6 +65,7 @@ func Main(version string) {
 	verbosePtr := flag.Bool("verbose", false, "")
 	prefetchPtr := flag.Uint("prefetch", 10, "")
 	lockTimeoutPtr := flag.Uint("lock-timeout", 15, "")
+	missingMigrationsPtr := flag.String("missing-migrations", "warn", "")
 	pathPtr := flag.String("path", "", "")
 	databasePtr := flag.String("database", "", "")
 	sourcePtr := flag.String("source", "", "")
@@ -75,14 +76,18 @@ func Main(version string) {
        migrate [ -version | -help ]
 
 Options:
-  -source          Location of the migrations (driver://url)
-  -path            Shorthand for -source=file://path
-  -database        Run migrations against this database (driver://url)
-  -prefetch N      Number of migrations to load in advance before executing (default 10)
-  -lock-timeout N  Allow N seconds to acquire database lock (default 15)
-  -verbose         Print verbose logging
-  -version         Print version
-  -help            Print usage
+  -source                  Location of the migrations (driver://url)
+  -path                    Shorthand for -source=file://path
+  -database                Run migrations against this database (driver://url)
+  -prefetch N              Number of migrations to load in advance before executing (default 10)
+  -lock-timeout N          Allow N seconds to acquire database lock (default 15)
+  -missing-migrations S    How to handle versions missing their up/down file:
+                           warn (log and apply an empty migration, default),
+                           strict (abort before executing anything),
+                           allow (silently apply an empty migration)
+  -verbose                 Print verbose logging
+  -version                 Print version
+  -help                    Print usage
 
 Commands:
   %s
@@ -114,6 +119,11 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 		os.Exit(0)
 	}
 
+	missingMigrationStrategy, err := parseMissingMigrationStrategy(*missingMigrationsPtr)
+	if err != nil {
+		log.fatalErr(err)
+	}
+
 	// translate -path into -source if given
 	if *sourcePtr == "" && *pathPtr != "" {
 		*sourcePtr = fmt.Sprintf("file://%v", *pathPtr)
@@ -134,6 +144,7 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 		migrater.Log = log
 		migrater.PrefetchMigrations = *prefetchPtr
 		migrater.LockTimeout = time.Duration(int64(*lockTimeoutPtr)) * time.Second
+		migrater.MissingMigrationStrategy = missingMigrationStrategy
 
 		// handle Ctrl+c
 		signals := make(chan os.Signal, 1)

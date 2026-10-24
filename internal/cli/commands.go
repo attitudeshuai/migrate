@@ -202,6 +202,22 @@ func dropCmd(m *migrate.Migrate) error {
 	return nil
 }
 
+// parseMissingMigrationStrategy maps the -missing-migrations flag value to a
+// migrate.MissingMigrationStrategy. An empty string defaults to warn.
+func parseMissingMigrationStrategy(s string) (migrate.MissingMigrationStrategy, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "warn":
+		return migrate.WarnMissingMigration, nil
+	case "strict":
+		return migrate.StrictMissingMigration, nil
+	case "allow":
+		return migrate.AllowMissingMigration, nil
+	default:
+		return migrate.WarnMissingMigration,
+			fmt.Errorf("invalid value %q for -missing-migrations: must be one of warn, strict, allow", s)
+	}
+}
+
 func forceCmd(m *migrate.Migrate, v int) error {
 	if err := m.Force(v); err != nil {
 		return err

@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -1407,5 +1409,315 @@ func equalDbSeq(t *testing.T, i int, expected migrationSequence, got *dStub.Stub
 	bs := expected.bodySequence()
 	if !got.EqualSequence(bs) {
 		t.Fatalf("\nexpected sequence %v,\ngot               %v, in %v", bs, got.MigrationSequence, i)
+	}
+}
+
+// captureLogger is a Logger that records all output in a buffer regardless of
+// the verbose flag.
+type captureLogger struct {
+	buf     bytes.Buffer
+	verbose bool
+}
+
+func (l *captureLogger) Printf(format string, v ...interface{}) {
+	fmt.Fprintf(&l.buf, format, v...)
+}
+
+func (l *captureLogger) Verbose() bool {
+	return l.verbose
+}
+
+func (l *captureLogger) String() string {
+	return l.buf.String()
+}
+
+// newPartialStubMigrations holds versions 1 (up only), 2 (up and down) and
+// 3 (up only):
+//
+//	|  1  |  2  |  3  |
+//	| u   | u d | u   |
+func newPartialStubMigrations() *source.Migrations {
+	ms := source.NewMigrations()
+	ms.Append(&source.Migration{Version: 1, Direction: source.Up, Identifier: "CREATE 1"})
+	ms.Append(&source.Migration{Version: 2, Direction: source.Up, Identifier: "CREATE 2"})
+	ms.Append(&source.Migration{Version: 2, Direction: source.Down, Identifier: "DROP 2"})
+	ms.Append(&source.Migration{Version: 3, Direction: source.Up, Identifier: "CREATE 3"})
+	return ms
+}
+
+func TestDefaultMissingMigrationStrategyIsWarn(t *testing.T) {
+	m, _ := New("stub://", "stub://")
+	if m.MissingMigrationStrategy != WarnMissingMigration {
+		t.Fatalf("expected default strategy %v, got %v", WarnMissingMigration, m.MissingMigrationStrategy)
+	}
+}
+
+func TestErrMissingMigrationsError(t *testing.T) {
+	e := ErrMissingMigrations{Missing: []MissingMigration{
+		{Version: 3, Direction: source.Down},
+		{Version: 5, Direction: source.Up},
+	}}
+	expected := "migration path is incomplete: version 3 has no down migration, version 5 has no up migration"
+	if e.Error() != expected {
+		t.Fatalf("expected %q, got %q", expected, e.Error())
+	}
+}
+
+func TestMissingMigrationStrategy(t *testing.T) {
+	t.Run("strict down lists all missing versions and runs nothing", func(t *testing.T) {
+		m, _ := New("stub://", "stub://")
+		m.MissingMigrationStrategy = StrictMissingMigration
+		m.sourceDrv.(*sStub.Stub).Migrations = newPartialStubMigrations()
+		dbDrv := m.databaseDrv.(*dStub.Stub)
+		if err := dbDrv.SetVersion(3, false); err != nil {
+			t.Fatal(err)
+		}
+
+		err := m.Down()
+		var emm ErrMissingMigrations
+		if !errors.As(err, &emm) {
+			t.Fatalf("expected ErrMissingMigrations, got %v", err)
+		}
+
+		expectedMissing := []MissingMigration{
+			{Version: 3, Direction: source.Down},
+			{Version: 1, Direction: source.Down},
+		}
+		if !reflect.DeepEqual(emm.Missing, expectedMissing) {
+			t.Fatalf("expected missing %v, got %v", expectedMissing, emm.Missing)
+		}
+
+		// no statement must have run and the version table must be untouched
+		if len(dbDrv.MigrationSequence) != 0 {
+			t.Fatalf("expected no statements executed, got %v", dbDrv.MigrationSequence)
+		}
+		if dbDrv.CurrentVersion != 3 || dbDrv.IsDirty {
+			t.Fatalf("expected clean version 3, got version %v dirty %v", dbDrv.CurrentVersion, dbDrv.IsDirty)
+		}
+	})
+
+	t.Run("strict up stops before any statement", func(t *testing.T) {
+		m, _ := New("stub://", "stub://")
+		m.MissingMigrationStrategy = StrictMissingMigration
+		m.sourceDrv.(*sStub.Stub).Migrations = sourceStubMigrations
+
+		err := m.Up()
+		var emm ErrMissingMigrations
+		if !errors.As(err, &emm) {
+			t.Fatalf("expected ErrMissingMigrations, got %v", err)
+		}
+		expectedMissing := []MissingMigration{{Version: 5, Direction: source.Up}}
+		if !reflect.DeepEqual(emm.Missing, expectedMissing) {
+			t.Fatalf("expected missing %v, got %v", expectedMissing, emm.Missing)
+		}
+
+		dbDrv := m.databaseDrv.(*dStub.Stub)
+		if len(dbDrv.MigrationSequence) != 0 {
+			t.Fatalf("expected no statements executed, got %v", dbDrv.MigrationSequence)
+		}
+	})
+
+	t.Run("strict goto up-only side target reports direction specific error", func(t *testing.T) {
+		m, _ := New("stub://", "stub://")
+		m.MissingMigrationStrategy = StrictMissingMigration
+		m.sourceDrv.(*sStub.Stub).Migrations = sourceStubMigrations
+
+		// version 5 only has a down file, it can not be reached going up
+		err := m.Migrate(5)
+		var emm ErrMissingMigrations
+		if !errors.As(err, &emm) {
+			t.Fatalf("expected ErrMissingMigrations, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "version 5") || !strings.Contains(err.Error(), "up") {
+			t.Fatalf("expected error naming version 5 and direction up, got %v", err)
+		}
+
+		dbDrv := m.databaseDrv.(*dStub.Stub)
+		if len(dbDrv.MigrationSequence) != 0 {
+			t.Fatalf("expected no statements executed, got %v", dbDrv.MigrationSequence)
+		}
+	})
+
+	t.Run("strict down goto target does not need its down file", func(t *testing.T) {
+		m, _ := New("stub://", "stub://")
+		m.MissingMigrationStrategy = StrictMissingMigration
+		m.sourceDrv.(*sStub.Stub).Migrations = sourceStubMigrations
+		dbDrv := m.databaseDrv.(*dStub.Stub)
+		if err := dbDrv.SetVersion(7, false); err != nil {
+			t.Fatal(err)
+		}
+
+		// going down to version 3 does not execute 3's (missing) down file
+		if err := m.Migrate(3); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if dbDrv.CurrentVersion != 3 {
+			t.Fatalf("expected version 3, got %v", dbDrv.CurrentVersion)
+		}
+		expected := []string{"DROP 7", "DROP 5", "DROP 4"}
+		if !dbDrv.EqualSequence(expected) {
+			t.Fatalf("expected %v, got %v", expected, dbDrv.MigrationSequence)
+		}
+	})
+
+	t.Run("warn down completes and logs every missing version and empty run", func(t *testing.T) {
+		m, _ := New("stub://", "stub://")
+		m.MissingMigrationStrategy = WarnMissingMigration
+		logger := &captureLogger{}
+		m.Log = logger
+		m.sourceDrv.(*sStub.Stub).Migrations = newPartialStubMigrations()
+		dbDrv := m.databaseDrv.(*dStub.Stub)
+		if err := dbDrv.SetVersion(3, false); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := m.Down(); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+
+		// empty migrations don't execute statements, only version 2's down runs
+		expected := []string{"DROP 2"}
+		if !dbDrv.EqualSequence(expected) {
+			t.Fatalf("expected %v, got %v", expected, dbDrv.MigrationSequence)
+		}
+		if dbDrv.CurrentVersion != -1 {
+			t.Fatalf("expected nil version, got %v", dbDrv.CurrentVersion)
+		}
+
+		logOutput := logger.String()
+		for _, expectedLog := range []string{
+			"Warning: version 3 has no down migration file",
+			"Warning: version 1 has no down migration file",
+			"No statements executed for 3/d <empty>: the down migration file is missing",
+			"No statements executed for 1/d <empty>: the down migration file is missing",
+		} {
+			if !strings.Contains(logOutput, expectedLog) {
+				t.Errorf("expected log to contain %q, got %q", expectedLog, logOutput)
+			}
+		}
+	})
+
+	t.Run("allow down keeps historical behavior without warnings", func(t *testing.T) {
+		m, _ := New("stub://", "stub://")
+		m.MissingMigrationStrategy = AllowMissingMigration
+		logger := &captureLogger{}
+		m.Log = logger
+		m.sourceDrv.(*sStub.Stub).Migrations = newPartialStubMigrations()
+		dbDrv := m.databaseDrv.(*dStub.Stub)
+		if err := dbDrv.SetVersion(3, false); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := m.Down(); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		expected := []string{"DROP 2"}
+		if !dbDrv.EqualSequence(expected) {
+			t.Fatalf("expected %v, got %v", expected, dbDrv.MigrationSequence)
+		}
+		if dbDrv.CurrentVersion != -1 {
+			t.Fatalf("expected nil version, got %v", dbDrv.CurrentVersion)
+		}
+
+		logOutput := logger.String()
+		if strings.Contains(logOutput, "Warning:") {
+			t.Errorf("expected no warning logs in allow mode, got %q", logOutput)
+		}
+		// empty runs are still marked unconditionally
+		if !strings.Contains(logOutput, "No statements executed for 3/d <empty>") ||
+			!strings.Contains(logOutput, "No statements executed for 1/d <empty>") {
+			t.Errorf("expected empty-run markers, got %q", logOutput)
+		}
+	})
+
+	t.Run("warn goto single-side target keeps empty migration semantics", func(t *testing.T) {
+		m, _ := New("stub://", "stub://")
+		m.MissingMigrationStrategy = WarnMissingMigration
+		m.sourceDrv.(*sStub.Stub).Migrations = sourceStubMigrations
+		dbDrv := m.databaseDrv.(*dStub.Stub)
+
+		if err := m.Migrate(5); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if dbDrv.CurrentVersion != 5 {
+			t.Fatalf("expected version 5, got %v", dbDrv.CurrentVersion)
+		}
+		expected := []string{"CREATE 1", "CREATE 3", "CREATE 4"}
+		if !dbDrv.EqualSequence(expected) {
+			t.Fatalf("expected %v, got %v", expected, dbDrv.MigrationSequence)
+		}
+	})
+
+	t.Run("complete migrations produce no warnings or empty-run markers", func(t *testing.T) {
+		m, _ := New("stub://", "stub://")
+		m.MissingMigrationStrategy = WarnMissingMigration
+		logger := &captureLogger{}
+		m.Log = logger
+		ms := source.NewMigrations()
+		ms.Append(&source.Migration{Version: 1, Direction: source.Up, Identifier: "CREATE 1"})
+		ms.Append(&source.Migration{Version: 1, Direction: source.Down, Identifier: "DROP 1"})
+		ms.Append(&source.Migration{Version: 2, Direction: source.Up, Identifier: "CREATE 2"})
+		ms.Append(&source.Migration{Version: 2, Direction: source.Down, Identifier: "DROP 2"})
+		m.sourceDrv.(*sStub.Stub).Migrations = ms
+
+		if err := m.Up(); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Down(); err != nil {
+			t.Fatal(err)
+		}
+
+		logOutput := logger.String()
+		if strings.Contains(logOutput, "Warning:") || strings.Contains(logOutput, "No statements executed") {
+			t.Fatalf("expected no warnings or empty-run markers, got %q", logOutput)
+		}
+	})
+}
+
+// TestPlanMatchesRead ensures the metadata-only planners enumerate exactly
+// the migrations that read/readUp/readDown will send, including their versions
+// and target versions.
+func TestPlanMatchesRead(t *testing.T) {
+	m, _ := New("stub://", "stub://")
+	m.sourceDrv.(*sStub.Stub).Migrations = sourceStubMigrations
+
+	assertSteps := func(i interface{}, steps []migrationStep, migrs []*Migration) {
+		if len(steps) != len(migrs) {
+			t.Fatalf("case %v: expected %d planned steps, got %d migrations: %v vs %v",
+				i, len(steps), len(migrs), steps, migrs)
+		}
+		for j := range steps {
+			if steps[j].version != migrs[j].Version || steps[j].targetVersion != migrs[j].TargetVersion {
+				t.Errorf("case %v step %d: planned %v=>%v, read %v=>%v",
+					i, j, steps[j].version, steps[j].targetVersion, migrs[j].Version, migrs[j].TargetVersion)
+			}
+		}
+	}
+
+	for from := -1; from <= 8; from++ {
+		for to := -1; to <= 8; to++ {
+			steps, _ := m.planMigrate(from, to)
+			ret := make(chan interface{})
+			go m.read(from, to, ret)
+			migrs, _ := migrationsFromChannel(ret)
+			assertSteps([2]int{from, to}, steps, migrs)
+		}
+	}
+
+	limits := []int{-1, 0, 1, 2, 3}
+	for from := -1; from <= 8; from++ {
+		for _, limit := range limits {
+			steps, _ := m.planUp(from, limit)
+			ret := make(chan interface{})
+			go m.readUp(from, limit, ret)
+			migrs, _ := migrationsFromChannel(ret)
+			assertSteps([2]int{from, limit}, steps, migrs)
+
+			steps, _ = m.planDown(from, limit)
+			ret = make(chan interface{})
+			go m.readDown(from, limit, ret)
+			migrs, _ = migrationsFromChannel(ret)
+			assertSteps([2]int{from, -limit}, steps, migrs)
+		}
 	}
 }

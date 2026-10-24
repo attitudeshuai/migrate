@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang-migrate/migrate/v4"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -249,6 +250,42 @@ func (s *CreateCmdSuite) TestCreateCmd() {
 
 			s.mustChdir(testCwd)
 			s.mustRemoveDir(baseDir)
+		})
+	}
+}
+
+func TestParseMissingMigrationStrategy(t *testing.T) {
+	cases := []struct {
+		name     string
+		value    string
+		expected migrate.MissingMigrationStrategy
+		hasErr   bool
+	}{
+		{"empty defaults to warn", "", migrate.WarnMissingMigration, false},
+		{"warn", "warn", migrate.WarnMissingMigration, false},
+		{"strict is case insensitive", "STRICT", migrate.StrictMissingMigration, false},
+		{"allow tolerates whitespace", " allow ", migrate.AllowMissingMigration, false},
+		{"invalid value", "bogus", migrate.WarnMissingMigration, true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			strategy, err := parseMissingMigrationStrategy(c.value)
+			if c.hasErr {
+				if err == nil {
+					t.Fatal("expected an error, got nil")
+				}
+				if !strings.Contains(err.Error(), "warn, strict, allow") {
+					t.Errorf("expected error listing valid values, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected no error, got %v", err)
+			}
+			if strategy != c.expected {
+				t.Errorf("expected strategy %v, got %v", c.expected, strategy)
+			}
 		})
 	}
 }

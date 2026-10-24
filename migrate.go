@@ -7,7 +7,9 @@ package migrate
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,6 +55,55 @@ func (e ErrDirty) Error() string {
 	return fmt.Sprintf("Dirty database version %v. Fix and force version.", e.Version)
 }
 
+// MissingMigrationStrategy configures how a migration run handles a version
+// on the execution path that is missing the direction file (up or down)
+// required for the current direction.
+type MissingMigrationStrategy int
+
+const (
+	// WarnMissingMigration logs every version missing its direction file
+	// before execution and continues. Versions missing their direction file
+	// are still applied as empty migrations. This is the default.
+	WarnMissingMigration MissingMigrationStrategy = iota
+
+	// StrictMissingMigration aborts the migration run before any statement
+	// is executed if at least one version on the execution path is missing
+	// its direction file. The returned error lists every missing version and
+	// direction.
+	StrictMissingMigration
+
+	// AllowMissingMigration keeps the historical behavior: versions missing
+	// their direction file are applied silently as empty migrations.
+	AllowMissingMigration
+)
+
+// MissingMigration describes a single version that is missing the migration
+// file for the direction required by the current execution path.
+type MissingMigration struct {
+	// Version is the migration version missing its direction file.
+	Version uint
+
+	// Direction is the required direction, either source.Up or source.Down.
+	Direction source.Direction
+}
+
+// ErrMissingMigrations is returned under the StrictMissingMigration strategy
+// when one or more versions on the execution path are missing the up or down
+// file required for the current direction.
+type ErrMissingMigrations struct {
+	// Missing lists every affected version in execution path order.
+	Missing []MissingMigration
+}
+
+// Error implements the error interface.
+func (e ErrMissingMigrations) Error() string {
+	msgs := make([]string, 0, len(e.Missing))
+	for _, mm := range e.Missing {
+		msgs = append(msgs, fmt.Sprintf("version %d has no %s migration", mm.Version, mm.Direction))
+	}
+	return "migration path is incomplete: " + strings.Join(msgs, ", ")
+}
+
 type Migrate struct {
 	sourceName         string
 	sourceDrv          source.Driver
@@ -78,6 +129,11 @@ type Migrate struct {
 	// LockTimeout defaults to DefaultLockTimeout,
 	// but can be set per Migrate instance.
 	LockTimeout time.Duration
+
+	// MissingMigrationStrategy configures what happens when a version on the
+	// execution path is missing the up or down file required for the current
+	// direction. It defaults to WarnMissingMigration.
+	MissingMigrationStrategy MissingMigrationStrategy
 }
 
 // New returns a new Migrate instance from a source URL and a database URL.
@@ -223,6 +279,14 @@ func (m *Migrate) Migrate(version uint) error {
 		return m.unlockErr(ErrDirty{curVersion})
 	}
 
+	steps, err := m.planMigrate(curVersion, int(version))
+	if err != nil {
+		return m.unlockErr(err)
+	}
+	if err := m.checkMigrationSteps(steps); err != nil {
+		return m.unlockErr(err)
+	}
+
 	ret := make(chan interface{}, m.PrefetchMigrations)
 	go m.read(curVersion, int(version), ret)
 
@@ -247,6 +311,19 @@ func (m *Migrate) Steps(n int) error {
 
 	if dirty {
 		return m.unlockErr(ErrDirty{curVersion})
+	}
+
+	var steps []migrationStep
+	if n > 0 {
+		steps, err = m.planUp(curVersion, n)
+	} else {
+		steps, err = m.planDown(curVersion, -n)
+	}
+	if err != nil {
+		return m.unlockErr(err)
+	}
+	if err := m.checkMigrationSteps(steps); err != nil {
+		return m.unlockErr(err)
 	}
 
 	ret := make(chan interface{}, m.PrefetchMigrations)
@@ -276,6 +353,14 @@ func (m *Migrate) Up() error {
 		return m.unlockErr(ErrDirty{curVersion})
 	}
 
+	steps, err := m.planUp(curVersion, -1)
+	if err != nil {
+		return m.unlockErr(err)
+	}
+	if err := m.checkMigrationSteps(steps); err != nil {
+		return m.unlockErr(err)
+	}
+
 	ret := make(chan interface{}, m.PrefetchMigrations)
 
 	go m.readUp(curVersion, -1, ret)
@@ -296,6 +381,14 @@ func (m *Migrate) Down() error {
 
 	if dirty {
 		return m.unlockErr(ErrDirty{curVersion})
+	}
+
+	steps, err := m.planDown(curVersion, -1)
+	if err != nil {
+		return m.unlockErr(err)
+	}
+	if err := m.checkMigrationSteps(steps); err != nil {
+		return m.unlockErr(err)
 	}
 
 	ret := make(chan interface{}, m.PrefetchMigrations)
@@ -714,6 +807,241 @@ func (m *Migrate) readDown(from int, limit int, ret chan<- interface{}) {
 	}
 }
 
+// migrationStep is one planned migration execution: applying Version's file
+// in Direction moves the database to TargetVersion.
+type migrationStep struct {
+	version       uint
+	targetVersion int
+}
+
+// direction returns source.Up if the step migrates up, otherwise source.Down.
+// It mirrors the direction detection used in newMigration.
+func (s migrationStep) direction() source.Direction {
+	if s.targetVersion >= int(s.version) {
+		return source.Up
+	}
+	return source.Down
+}
+
+// planMigrate returns the migration steps read() would execute when migrating
+// from version `from` to version `to`. It only reads source metadata, it does
+// not open migration bodies for buffering. If read() would fail before sending
+// the first migration (e.g. because the from/to version does not exist), the
+// same error is returned here.
+func (m *Migrate) planMigrate(from, to int) ([]migrationStep, error) {
+	steps := make([]migrationStep, 0)
+
+	// check if from version exists
+	if from >= 0 {
+		if err := m.versionExists(suint(from)); err != nil {
+			return steps, err
+		}
+	}
+
+	// check if to version exists
+	if to >= 0 {
+		if err := m.versionExists(suint(to)); err != nil {
+			return steps, err
+		}
+	}
+
+	// no change?
+	if from == to {
+		return steps, nil
+	}
+
+	if from < to {
+		// it's going up
+		// apply first migration if from is nil version
+		if from == -1 {
+			firstVersion, err := m.sourceDrv.First()
+			if err != nil {
+				return steps, err
+			}
+			steps = append(steps, migrationStep{firstVersion, int(firstVersion)})
+			from = int(firstVersion)
+		}
+
+		// run until we reach target ...
+		for from < to {
+			next, err := m.sourceDrv.Next(suint(from))
+			if err != nil {
+				return steps, err
+			}
+			steps = append(steps, migrationStep{next, int(next)})
+			from = int(next)
+		}
+	} else {
+		// it's going down
+		// run until we reach target ...
+		for from > to && from >= 0 {
+			prev, err := m.sourceDrv.Prev(suint(from))
+			if errors.Is(err, os.ErrNotExist) && to == -1 {
+				// apply nil migration
+				steps = append(steps, migrationStep{suint(from), -1})
+				return steps, nil
+			} else if err != nil {
+				return steps, err
+			}
+
+			steps = append(steps, migrationStep{suint(from), int(prev)})
+			from = int(prev)
+		}
+	}
+
+	return steps, nil
+}
+
+// planUp returns the migration steps readUp() would execute. It only reads
+// source metadata. Boundary errors that readUp() reports after sending the
+// available migrations (e.g. ErrShortLimit) are not returned here; the
+// returned steps only cover the migrations that would actually be applied.
+func (m *Migrate) planUp(from int, limit int) ([]migrationStep, error) {
+	steps := make([]migrationStep, 0)
+
+	// check if from version exists
+	if from >= 0 {
+		if err := m.versionExists(suint(from)); err != nil {
+			return steps, err
+		}
+	}
+
+	if limit == 0 {
+		return steps, nil
+	}
+
+	count := 0
+	for count < limit || limit == -1 {
+		// apply first migration if from is nil version
+		if from == -1 {
+			firstVersion, err := m.sourceDrv.First()
+			if err != nil {
+				return steps, nil
+			}
+			steps = append(steps, migrationStep{firstVersion, int(firstVersion)})
+			from = int(firstVersion)
+			count++
+			continue
+		}
+
+		// apply next migration
+		next, err := m.sourceDrv.Next(suint(from))
+		if err != nil {
+			return steps, nil
+		}
+		steps = append(steps, migrationStep{next, int(next)})
+		from = int(next)
+		count++
+	}
+
+	return steps, nil
+}
+
+// planDown returns the migration steps readDown() would execute. It only
+// reads source metadata. Boundary errors that readDown() reports after
+// sending the available migrations (e.g. ErrShortLimit) are not returned
+// here; the returned steps only cover the migrations that would actually be
+// applied.
+func (m *Migrate) planDown(from int, limit int) ([]migrationStep, error) {
+	steps := make([]migrationStep, 0)
+
+	// check if from version exists
+	if from >= 0 {
+		if err := m.versionExists(suint(from)); err != nil {
+			return steps, err
+		}
+	}
+
+	if limit == 0 {
+		return steps, nil
+	}
+
+	// already at nil version, no migrations can be applied
+	if from == -1 {
+		return steps, nil
+	}
+
+	count := 0
+	for count < limit || limit == -1 {
+		prev, err := m.sourceDrv.Prev(suint(from))
+		if errors.Is(err, os.ErrNotExist) {
+			// no limit or haven't reached limit, apply "first" migration
+			if limit == -1 || limit-count > 0 {
+				firstVersion, err := m.sourceDrv.First()
+				if err != nil {
+					return steps, nil
+				}
+				steps = append(steps, migrationStep{firstVersion, -1})
+				count++
+			}
+			return steps, nil
+		}
+		if err != nil {
+			return steps, nil
+		}
+
+		steps = append(steps, migrationStep{suint(from), int(prev)})
+		from = int(prev)
+		count++
+	}
+
+	return steps, nil
+}
+
+// checkMigrationSteps verifies that every planned step has the migration file
+// of its execution direction available in the source. The check is read-only
+// and does not touch the database. Missing files are handled according to
+// MissingMigrationStrategy.
+func (m *Migrate) checkMigrationSteps(steps []migrationStep) error {
+	missing := make([]MissingMigration, 0)
+
+	for _, step := range steps {
+		var body io.ReadCloser
+		var err error
+
+		if step.direction() == source.Up {
+			body, _, err = m.sourceDrv.ReadUp(step.version)
+		} else {
+			body, _, err = m.sourceDrv.ReadDown(step.version)
+		}
+
+		if err == nil {
+			if errClose := body.Close(); errClose != nil {
+				return errClose
+			}
+			continue
+		}
+
+		if errors.Is(err, os.ErrNotExist) {
+			missing = append(missing, MissingMigration{Version: step.version, Direction: step.direction()})
+			continue
+		}
+
+		return err
+	}
+
+	if len(missing) == 0 {
+		return nil
+	}
+
+	switch m.MissingMigrationStrategy {
+	case StrictMissingMigration:
+		return ErrMissingMigrations{Missing: missing}
+
+	case AllowMissingMigration:
+		// preserve the historical empty-migration behavior silently
+		return nil
+
+	default:
+		// WarnMissingMigration
+		for _, mm := range missing {
+			m.logPrintf("Warning: version %d has no %s migration file; it will be applied as an empty migration without executing any statements\n",
+				mm.Version, mm.Direction)
+		}
+		return nil
+	}
+}
+
 // runMigrations reads *Migration and error from a channel. Any other type
 // sent on this channel will result in a panic. Each migration is then
 // proxied to the database driver and run against the database.
@@ -744,6 +1072,12 @@ func (m *Migrate) runMigrations(ret <-chan interface{}) error {
 				if err := m.databaseDrv.Run(migr.BufferedBody); err != nil {
 					return err
 				}
+			} else {
+				// an empty migration executes no statements, but the version
+				// is still recorded; make this explicit regardless of the
+				// configured missing-migration strategy
+				m.logPrintf("No statements executed for %v: the %s migration file is missing\n",
+					migr.LogString(), migr.direction())
 			}
 
 			// set clean state
@@ -772,7 +1106,9 @@ func (m *Migrate) runMigrations(ret <-chan interface{}) error {
 }
 
 // versionExists checks the source if either the up or down migration for
-// the specified migration version exists.
+// the specified migration version exists. It confirms that a version is known
+// to the source at all, not that it is executable in either direction.
+// Direction-specific completeness is checked by checkMigrationSteps.
 func (m *Migrate) versionExists(version uint) (result error) {
 	// try up migration first
 	up, _, err := m.sourceDrv.ReadUp(version)

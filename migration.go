@@ -117,6 +117,14 @@ func (m *Migration) LogString() string {
 	return fmt.Sprintf("%v/%v %v", m.Version, directionStr, m.Identifier)
 }
 
+// direction returns the migration direction as a word, either "up" or "down".
+func (m *Migration) direction() string {
+	if m.TargetVersion < int(m.Version) {
+		return "down"
+	}
+	return "up"
+}
+
 // Buffer buffers Body up to BufferSize.
 // Calling this function blocks. Call with goroutine.
 func (m *Migration) Buffer() (berr error) {
