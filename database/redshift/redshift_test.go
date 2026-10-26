@@ -45,7 +45,7 @@ var (
 )
 
 func redshiftConnectionString(host, port string) string {
-	return connectionString("redshift", host, port)
+	return connectionString("redshift", host, port) + "&x-drop-authorized=true"
 }
 
 func pgConnectionString(host, port string) string {
@@ -295,7 +295,7 @@ func TestRedshift_Lock(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := pgConnectionString(ip, port)
+		addr := pgConnectionString(ip, port) + "&x-drop-authorized=true"
 		p := &Redshift{}
 		d, err := p.Open(addr)
 		if err != nil {

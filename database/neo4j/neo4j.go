@@ -34,6 +34,12 @@ type Config struct {
 	MigrationsLabel       string
 	MultiStatement        bool
 	MultiStatementMaxSize int
+
+	// DropAuthorization states whether Drop is explicitly authorized for the
+	// instance. The zero value denies Drop. Open populates it from the
+	// x-drop-authorized connection parameter; set Authorized to true here when
+	// creating the driver via WithInstance.
+	DropAuthorization database.DropAuthorization
 }
 
 type Neo4j struct {
@@ -53,6 +59,8 @@ func WithInstance(driver neo4j.Driver, config *Config) (database.Driver, error) 
 		driver: driver,
 		config: config,
 	}
+
+	config.DropAuthorization = database.NormalizeDropAuthorization(config.DropAuthorization, "")
 
 	if err := nDriver.ensureVersionConstraint(); err != nil {
 		return nil, err
@@ -98,6 +106,9 @@ func (n *Neo4j) Open(url string) (database.Driver, error) {
 		}
 	}
 
+	dropAuthorization := database.ParseDropAuthorization(uri.Query())
+	dropAuthorization.InstanceID = uri.Host
+
 	uri.RawQuery = ""
 
 	driver, err := neo4j.NewDriver(uri.String(), authToken, func(config *neo4j.Config) {
@@ -111,6 +122,7 @@ func (n *Neo4j) Open(url string) (database.Driver, error) {
 		MigrationsLabel:       DefaultMigrationsLabel,
 		MultiStatement:        multi,
 		MultiStatementMaxSize: multiStatementMaxSize,
+		DropAuthorization:     dropAuthorization,
 	})
 }
 
@@ -254,7 +266,18 @@ ORDER BY COALESCE(sm.ts, datetime({year: 0})) DESC, sm.version DESC LIMIT 1`,
 	return mr.Version, mr.Dirty, err
 }
 
+// DropAuthorized implements database.DropAuthorizer.
+func (n *Neo4j) DropAuthorized() database.DropAuthorization {
+	return n.config.DropAuthorization
+}
+
+var _ database.DropAuthorizer = (*Neo4j)(nil)
+
 func (n *Neo4j) Drop() (err error) {
+	if err := database.RequireDropAuthorization(n.config.DropAuthorization); err != nil {
+		return err
+	}
+
 	session, err := n.driver.Session(neo4j.AccessModeWrite)
 	if err != nil {
 		return err

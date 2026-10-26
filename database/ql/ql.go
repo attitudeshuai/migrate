@@ -29,6 +29,12 @@ var (
 type Config struct {
 	MigrationsTable string
 	DatabaseName    string
+
+	// DropAuthorization states whether Drop is explicitly authorized for the
+	// instance. The zero value denies Drop. Open populates it from the
+	// x-drop-authorized connection parameter; set Authorized to true here when
+	// creating the driver via WithInstance.
+	DropAuthorization database.DropAuthorization
 }
 
 type Ql struct {
@@ -55,6 +61,9 @@ func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
 		db:     instance,
 		config: config,
 	}
+
+	config.DropAuthorization = database.NormalizeDropAuthorization(config.DropAuthorization, config.DatabaseName)
+
 	if err := mx.ensureVersionTable(); err != nil {
 		return nil, err
 	}
@@ -109,8 +118,9 @@ func (m *Ql) Open(url string) (database.Driver, error) {
 		migrationsTable = DefaultMigrationsTable
 	}
 	mx, err := WithInstance(db, &Config{
-		DatabaseName:    purl.Path,
-		MigrationsTable: migrationsTable,
+		DatabaseName:      purl.Path,
+		MigrationsTable:   migrationsTable,
+		DropAuthorization: database.ParseDropAuthorization(purl.Query()),
 	})
 	if err != nil {
 		return nil, err
@@ -120,7 +130,19 @@ func (m *Ql) Open(url string) (database.Driver, error) {
 func (m *Ql) Close() error {
 	return m.db.Close()
 }
+
+// DropAuthorized implements database.DropAuthorizer.
+func (m *Ql) DropAuthorized() database.DropAuthorization {
+	return m.config.DropAuthorization
+}
+
+var _ database.DropAuthorizer = (*Ql)(nil)
+
 func (m *Ql) Drop() (err error) {
+	if err := database.RequireDropAuthorization(m.config.DropAuthorization); err != nil {
+		return err
+	}
+
 	query := `SELECT Name FROM __Table`
 	tables, err := m.db.Query(query)
 	if err != nil {

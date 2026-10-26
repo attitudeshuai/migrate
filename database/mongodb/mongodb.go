@@ -59,6 +59,12 @@ type Config struct {
 	MigrationsCollection string
 	TransactionMode      bool
 	Locking              Locking
+
+	// DropAuthorization states whether Drop is explicitly authorized for the
+	// database. The zero value denies Drop. Open populates it from the
+	// x-drop-authorized connection parameter; set Authorized to true here when
+	// creating the driver via WithInstance.
+	DropAuthorization database.DropAuthorization
 }
 type versionInfo struct {
 	Version int  `bson:"version"`
@@ -100,6 +106,8 @@ func WithInstance(instance *mongo.Client, config *Config) (database.Driver, erro
 		db:     instance.Database(config.DatabaseName),
 		config: config,
 	}
+
+	config.DropAuthorization = database.NormalizeDropAuthorization(config.DropAuthorization, config.DatabaseName)
 
 	if mc.config.Locking.Enabled {
 		if err := mc.ensureLockTable(); err != nil {
@@ -175,6 +183,7 @@ func (m *Mongo) Open(dsn string) (database.Driver, error) {
 			Enabled:        advisoryLockingFlag,
 			Interval:       maxLockCheckInterval,
 		},
+		DropAuthorization: database.ParseDropAuthorization(unknown),
 	})
 	if err != nil {
 		return nil, err
@@ -297,7 +306,17 @@ func (m *Mongo) Close() error {
 	return m.client.Disconnect(context.TODO())
 }
 
+// DropAuthorized implements database.DropAuthorizer.
+func (m *Mongo) DropAuthorized() database.DropAuthorization {
+	return m.config.DropAuthorization
+}
+
+var _ database.DropAuthorizer = (*Mongo)(nil)
+
 func (m *Mongo) Drop() error {
+	if err := database.RequireDropAuthorization(m.config.DropAuthorization); err != nil {
+		return err
+	}
 	return m.db.Drop(context.TODO())
 }
 

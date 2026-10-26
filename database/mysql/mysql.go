@@ -42,6 +42,12 @@ type Config struct {
 	DatabaseName     string
 	NoLock           bool
 	StatementTimeout time.Duration
+
+	// DropAuthorization states whether Drop is explicitly authorized for the
+	// instance. The zero value denies Drop. Open populates it from the
+	// x-drop-authorized connection parameter; set Authorized to true here when
+	// creating the driver via WithInstance/WithConnection.
+	DropAuthorization database.DropAuthorization
 }
 
 type Mysql struct {
@@ -87,6 +93,8 @@ func WithConnection(ctx context.Context, conn *sql.Conn, config *Config) (*Mysql
 	if len(config.MigrationsTable) == 0 {
 		config.MigrationsTable = DefaultMigrationsTable
 	}
+
+	config.DropAuthorization = database.NormalizeDropAuthorization(config.DropAuthorization, config.DatabaseName)
 
 	if err := mx.ensureVersionTable(); err != nil {
 		return nil, err
@@ -251,16 +259,19 @@ func (m *Mysql) Open(url string) (database.Driver, error) {
 		}
 	}
 
+	dropAuthorization := database.ParseDropAuthorizationParams(customParams)
+
 	db, err := sql.Open("mysql", config.FormatDSN())
 	if err != nil {
 		return nil, err
 	}
 
 	mx, err := WithInstance(db, &Config{
-		DatabaseName:     config.DBName,
-		MigrationsTable:  customParams["x-migrations-table"],
-		NoLock:           noLock,
-		StatementTimeout: time.Duration(statementTimeout) * time.Millisecond,
+		DatabaseName:      config.DBName,
+		MigrationsTable:   customParams["x-migrations-table"],
+		NoLock:            noLock,
+		StatementTimeout:  time.Duration(statementTimeout) * time.Millisecond,
+		DropAuthorization: dropAuthorization,
 	})
 	if err != nil {
 		return nil, err
@@ -407,7 +418,18 @@ func (m *Mysql) Version() (version int, dirty bool, err error) {
 	}
 }
 
+// DropAuthorized implements database.DropAuthorizer.
+func (m *Mysql) DropAuthorized() database.DropAuthorization {
+	return m.config.DropAuthorization
+}
+
+var _ database.DropAuthorizer = (*Mysql)(nil)
+
 func (m *Mysql) Drop() (err error) {
+	if err := database.RequireDropAuthorization(m.config.DropAuthorization); err != nil {
+		return err
+	}
+
 	// select all tables
 	query := `SHOW TABLES LIKE '%'`
 	tables, err := m.conn.QueryContext(context.Background(), query)

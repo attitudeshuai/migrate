@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database"
 	dt "github.com/golang-migrate/migrate/v4/database/testing"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	_ "github.com/mutecomm/go-sqlcipher/v4"
@@ -17,9 +18,12 @@ import (
 func Test(t *testing.T) {
 	dir := t.TempDir()
 	t.Logf("DB path : %s\n", filepath.Join(dir, "sqlite3.db"))
-	p := &Sqlite{}
-	addr := fmt.Sprintf("sqlite3://%s", filepath.Join(dir, "sqlite3.db"))
-	d, err := p.Open(addr)
+
+	db, err := sql.Open("sqlite3", filepath.Join(dir, "sqlite3.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := WithInstance(db, &Config{DropAuthorization: database.DropAuthorization{Authorized: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +43,7 @@ func TestMigrate(t *testing.T) {
 			return
 		}
 	}()
-	driver, err := WithInstance(db, &Config{})
+	driver, err := WithInstance(db, &Config{DropAuthorization: database.DropAuthorization{Authorized: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,9 +100,14 @@ func TestMigrationTable(t *testing.T) {
 func TestNoTxWrap(t *testing.T) {
 	dir := t.TempDir()
 	t.Logf("DB path : %s\n", filepath.Join(dir, "sqlite3.db"))
-	p := &Sqlite{}
-	addr := fmt.Sprintf("sqlite3://%s?x-no-tx-wrap=true", filepath.Join(dir, "sqlite3.db"))
-	d, err := p.Open(addr)
+	db, err := sql.Open("sqlite3", filepath.Join(dir, "sqlite3.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := WithInstance(db, &Config{
+		NoTxWrap:          true,
+		DropAuthorization: database.DropAuthorization{Authorized: true},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

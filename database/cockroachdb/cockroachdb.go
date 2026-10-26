@@ -37,6 +37,12 @@ type Config struct {
 	LockTable       string
 	ForceLock       bool
 	DatabaseName    string
+
+	// DropAuthorization states whether Drop is explicitly authorized for the
+	// instance. The zero value denies Drop. Open populates it from the
+	// x-drop-authorized connection parameter; set Authorized to true here when
+	// creating the driver via WithInstance.
+	DropAuthorization database.DropAuthorization
 }
 
 type CockroachDb struct {
@@ -83,6 +89,8 @@ func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
 		config: config,
 	}
 
+	config.DropAuthorization = database.NormalizeDropAuthorization(config.DropAuthorization, config.DatabaseName)
+
 	// ensureVersionTable is a locking operation, so we need to ensureLockTable before we ensureVersionTable.
 	if err := px.ensureLockTable(); err != nil {
 		return nil, err
@@ -128,10 +136,11 @@ func (c *CockroachDb) Open(url string) (database.Driver, error) {
 	}
 
 	px, err := WithInstance(db, &Config{
-		DatabaseName:    purl.Path,
-		MigrationsTable: migrationsTable,
-		LockTable:       lockTable,
-		ForceLock:       forceLock,
+		DatabaseName:      purl.Path,
+		MigrationsTable:   migrationsTable,
+		LockTable:         lockTable,
+		ForceLock:         forceLock,
+		DropAuthorization: database.ParseDropAuthorization(purl.Query()),
 	})
 	if err != nil {
 		return nil, err
@@ -267,7 +276,18 @@ func (c *CockroachDb) Version() (version int, dirty bool, err error) {
 	}
 }
 
+// DropAuthorized implements database.DropAuthorizer.
+func (c *CockroachDb) DropAuthorized() database.DropAuthorization {
+	return c.config.DropAuthorization
+}
+
+var _ database.DropAuthorizer = (*CockroachDb)(nil)
+
 func (c *CockroachDb) Drop() (err error) {
+	if err := database.RequireDropAuthorization(c.config.DropAuthorization); err != nil {
+		return err
+	}
+
 	// select all tables in current schema
 	query := `SELECT table_name FROM information_schema.tables WHERE table_schema=(SELECT current_schema())`
 	tables, err := c.db.Query(query)

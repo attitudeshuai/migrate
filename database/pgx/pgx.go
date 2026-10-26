@@ -63,6 +63,12 @@ type Config struct {
 	MigrationsTableQuoted bool
 	MultiStatementEnabled bool
 	MultiStatementMaxSize int
+
+	// DropAuthorization states whether Drop is explicitly authorized for the
+	// instance. The zero value denies Drop. Open populates it from the
+	// x-drop-authorized connection parameter; set Authorized to true here when
+	// creating the driver via WithInstance.
+	DropAuthorization database.DropAuthorization
 }
 
 type Postgres struct {
@@ -149,6 +155,8 @@ func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
 		config: config,
 	}
 
+	config.DropAuthorization = database.NormalizeDropAuthorization(config.DropAuthorization, config.DatabaseName)
+
 	if err := px.ensureLockTable(); err != nil {
 		return nil, err
 	}
@@ -228,6 +236,7 @@ func (p *Postgres) Open(url string) (database.Driver, error) {
 		MultiStatementMaxSize: multiStatementMaxSize,
 		LockStrategy:          lockStrategy,
 		LockTable:             lockTable,
+		DropAuthorization:     database.ParseDropAuthorization(purl.Query()),
 	})
 
 	if err != nil {
@@ -499,7 +508,18 @@ func (p *Postgres) Version() (version int, dirty bool, err error) {
 	}
 }
 
+// DropAuthorized implements database.DropAuthorizer.
+func (p *Postgres) DropAuthorized() database.DropAuthorization {
+	return p.config.DropAuthorization
+}
+
+var _ database.DropAuthorizer = (*Postgres)(nil)
+
 func (p *Postgres) Drop() (err error) {
+	if err := database.RequireDropAuthorization(p.config.DropAuthorization); err != nil {
+		return err
+	}
+
 	// select all tables in current schema
 	query := `SELECT table_name FROM information_schema.tables WHERE table_schema=(SELECT current_schema()) AND table_type='BASE TABLE'`
 	tables, err := p.conn.QueryContext(context.Background(), query)

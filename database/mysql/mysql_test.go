@@ -88,7 +88,7 @@ func Test(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := fmt.Sprintf("mysql://root:root@tcp(%v:%v)/public", ip, port)
+		addr := fmt.Sprintf("mysql://root:root@tcp(%v:%v)/public?x-drop-authorized=true", ip, port)
 		p := &Mysql{}
 		d, err := p.Open(addr)
 		if err != nil {
@@ -121,7 +121,7 @@ func TestMigrate(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := fmt.Sprintf("mysql://root:root@tcp(%v:%v)/public", ip, port)
+		addr := fmt.Sprintf("mysql://root:root@tcp(%v:%v)/public?x-drop-authorized=true", ip, port)
 		p := &Mysql{}
 		d, err := p.Open(addr)
 		if err != nil {
@@ -159,7 +159,7 @@ func TestMigrateAnsiQuotes(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := fmt.Sprintf("mysql://root:root@tcp(%v:%v)/public", ip, port)
+		addr := fmt.Sprintf("mysql://root:root@tcp(%v:%v)/public?x-drop-authorized=true", ip, port)
 		p := &Mysql{}
 		d, err := p.Open(addr)
 		if err != nil {
@@ -195,7 +195,7 @@ func TestLockWorks(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := fmt.Sprintf("mysql://root:root@tcp(%v:%v)/public", ip, port)
+		addr := fmt.Sprintf("mysql://root:root@tcp(%v:%v)/public?x-drop-authorized=true", ip, port)
 		p := &Mysql{}
 		d, err := p.Open(addr)
 		if err != nil {

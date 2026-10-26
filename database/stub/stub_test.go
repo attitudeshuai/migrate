@@ -1,17 +1,18 @@
 package stub
 
 import (
-	"github.com/golang-migrate/migrate/v4"
-	"github.com/golang-migrate/migrate/v4/source"
-	"github.com/golang-migrate/migrate/v4/source/stub"
 	"testing"
 
+	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database"
 	dt "github.com/golang-migrate/migrate/v4/database/testing"
+	"github.com/golang-migrate/migrate/v4/source"
+	"github.com/golang-migrate/migrate/v4/source/stub"
 )
 
 func Test(t *testing.T) {
 	s := &Stub{}
-	d, err := s.Open("")
+	d, err := s.Open("stub://?" + database.DropAuthorizationParam + "=true")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -20,7 +21,7 @@ func Test(t *testing.T) {
 
 func TestMigrate(t *testing.T) {
 	s := &Stub{}
-	d, err := s.Open("")
+	d, err := s.Open("stub://?" + database.DropAuthorizationParam + "=true")
 	if err != nil {
 		t.Fatal(err)
 	}

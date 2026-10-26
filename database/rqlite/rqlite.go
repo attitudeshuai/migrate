@@ -38,6 +38,12 @@ type Config struct {
 	ConnectInsecure bool
 	// MigrationsTable configures the migrations table name
 	MigrationsTable string
+
+	// DropAuthorization states whether Drop is explicitly authorized for the
+	// instance. The zero value denies Drop. Open populates it from the
+	// x-drop-authorized connection parameter; set Authorized to true here when
+	// creating the driver via WithInstance.
+	DropAuthorization database.DropAuthorization
 }
 
 type Rqlite struct {
@@ -67,6 +73,8 @@ func WithInstance(instance *gorqlite.Connection, config *Config) (database.Drive
 		db:     instance,
 		config: config,
 	}
+
+	config.DropAuthorization = database.NormalizeDropAuthorization(config.DropAuthorization, "")
 
 	if err := driver.ensureVersionTable(); err != nil {
 		return nil, err
@@ -230,10 +238,21 @@ func (r *Rqlite) Version() (version int, dirty bool, err error) {
 	return version, dirty, nil
 }
 
+// DropAuthorized implements database.DropAuthorizer.
+func (r *Rqlite) DropAuthorized() database.DropAuthorization {
+	return r.config.DropAuthorization
+}
+
+var _ database.DropAuthorizer = (*Rqlite)(nil)
+
 // Drop deletes everything in the database.
 // Note that this is a breaking action, a new call to Open() is necessary to
 // ensure subsequent calls work as expected.
 func (r *Rqlite) Drop() error {
+	if err := database.RequireDropAuthorization(r.config.DropAuthorization); err != nil {
+		return err
+	}
+
 	query := `SELECT name FROM sqlite_master WHERE type = 'table'`
 
 	tables, err := r.db.QueryOne(query)
@@ -285,6 +304,8 @@ func parseUrl(url string) (*nurl.URL, *Config, error) {
 		return nil, nil, err
 	}
 
+	config.DropAuthorization = database.NormalizeDropAuthorization(config.DropAuthorization, parsedUrl.Host)
+
 	if parsedUrl.Scheme != "rqlite" {
 		return nil, nil, fmt.Errorf("bad scheme: %w", ErrBadConfig)
 	}
@@ -323,6 +344,8 @@ func parseConfigFromQuery(queryVals nurl.Values) (*Config, error) {
 		}
 		c.ConnectInsecure = connectInsecure
 	}
+
+	c.DropAuthorization = database.ParseDropAuthorization(queryVals)
 
 	return &c, nil
 }

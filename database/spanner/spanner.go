@@ -50,6 +50,12 @@ type Config struct {
 	// Parsing outputs clean DDL statements such as reformatted
 	// and void of comments.
 	CleanStatements bool
+
+	// DropAuthorization states whether Drop is explicitly authorized for the
+	// database. The zero value denies Drop. Open populates it from the
+	// x-drop-authorized connection parameter; set Authorized to true here when
+	// creating the driver via WithInstance.
+	DropAuthorization database.DropAuthorization
 }
 
 // Spanner implements database.Driver for Google Cloud Spanner
@@ -92,6 +98,8 @@ func WithInstance(instance *DB, config *Config) (database.Driver, error) {
 		config: config,
 	}
 
+	config.DropAuthorization = database.NormalizeDropAuthorization(config.DropAuthorization, config.DatabaseName)
+
 	if err := sx.ensureVersionTable(); err != nil {
 		return nil, err
 	}
@@ -131,9 +139,10 @@ func (s *Spanner) Open(url string) (database.Driver, error) {
 
 	db := &DB{admin: adminClient, data: dataClient}
 	return WithInstance(db, &Config{
-		DatabaseName:    dbname,
-		MigrationsTable: migrationsTable,
-		CleanStatements: clean,
+		DatabaseName:      dbname,
+		MigrationsTable:   migrationsTable,
+		CleanStatements:   clean,
+		DropAuthorization: database.ParseDropAuthorization(purl.Query()),
 	})
 }
 
@@ -248,7 +257,18 @@ var nameMatcher = regexp.MustCompile(`(CREATE TABLE\s(\S+)\s)|(CREATE.+INDEX\s(\
 // provided in the schema. Assuming the schema describes how the database can
 // be "build up", it seems logical to "unbuild" the database simply by going the
 // opposite direction. More testing
+// DropAuthorized implements database.DropAuthorizer.
+func (s *Spanner) DropAuthorized() database.DropAuthorization {
+	return s.config.DropAuthorization
+}
+
+var _ database.DropAuthorizer = (*Spanner)(nil)
+
 func (s *Spanner) Drop() error {
+	if err := database.RequireDropAuthorization(s.config.DropAuthorization); err != nil {
+		return err
+	}
+
 	ctx := context.Background()
 	res, err := s.db.admin.GetDatabaseDdl(ctx, &adminpb.GetDatabaseDdlRequest{
 		Database: s.config.DatabaseName,

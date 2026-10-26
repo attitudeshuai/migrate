@@ -112,7 +112,7 @@ func test(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := msConnectionString(ip, port)
+		addr := msConnectionString(ip, port) + "&x-drop-authorized=true"
 		p := &SQLServer{}
 		d, err := p.Open(addr)
 		if err != nil {
@@ -137,7 +137,7 @@ func testMigrate(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := msConnectionString(ip, port)
+		addr := msConnectionString(ip, port) + "&x-drop-authorized=true"
 		p := &SQLServer{}
 		d, err := p.Open(addr)
 		if err != nil {
@@ -232,7 +232,7 @@ func testLockWorks(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := fmt.Sprintf("sqlserver://sa:%v@%v:%v?master", saPassword, ip, port)
+		addr := fmt.Sprintf("sqlserver://sa:%v@%v:%v?master&x-drop-authorized=true", saPassword, ip, port)
 		p := &SQLServer{}
 		d, err := p.Open(addr)
 		if err != nil {
@@ -295,7 +295,7 @@ func testOpenWithPasswordAndMSI(t *testing.T) {
 			t.Fatal("Open should fail when both password and useMsi=true are passed.")
 		}
 
-		addr = msConnectionStringMsiWithPassword(ip, port, false)
+		addr = msConnectionStringMsiWithPassword(ip, port, false) + "&x-drop-authorized=true"
 		p = &SQLServer{}
 		d, err := p.Open(addr)
 		if err != nil {

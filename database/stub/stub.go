@@ -2,6 +2,7 @@ package stub
 
 import (
 	"io"
+	nurl "net/url"
 	"reflect"
 	"sync/atomic"
 
@@ -25,17 +26,29 @@ type Stub struct {
 }
 
 func (s *Stub) Open(url string) (database.Driver, error) {
+	authz := database.ParseDropAuthorization(nurl.Values{})
+	if purl, err := nurl.Parse(url); err == nil {
+		authz = database.ParseDropAuthorization(purl.Query())
+	}
+	authz.InstanceID = url
+
 	return &Stub{
 		Url:               url,
 		CurrentVersion:    database.NilVersion,
 		MigrationSequence: make([]string, 0),
-		Config:            &Config{},
+		Config:            &Config{DropAuthorization: authz},
 	}, nil
 }
 
-type Config struct{}
+type Config struct {
+	// DropAuthorization states whether Drop is explicitly authorized for the
+	// instance. The zero value denies Drop. Set Authorized to true when
+	// creating the driver via WithInstance.
+	DropAuthorization database.DropAuthorization
+}
 
 func WithInstance(instance interface{}, config *Config) (database.Driver, error) {
+	config.DropAuthorization = database.NormalizeDropAuthorization(config.DropAuthorization, "")
 	return &Stub{
 		Instance:          instance,
 		CurrentVersion:    database.NilVersion,
@@ -84,7 +97,18 @@ func (s *Stub) Version() (version int, dirty bool, err error) {
 
 const DROP = "DROP"
 
+// DropAuthorized implements database.DropAuthorizer.
+func (s *Stub) DropAuthorized() database.DropAuthorization {
+	return s.Config.DropAuthorization
+}
+
+var _ database.DropAuthorizer = (*Stub)(nil)
+
 func (s *Stub) Drop() error {
+	if err := database.RequireDropAuthorization(s.Config.DropAuthorization); err != nil {
+		return err
+	}
+
 	s.CurrentVersion = database.NilVersion
 	s.LastRunMigration = nil
 	s.MigrationSequence = append(s.MigrationSequence, DROP)

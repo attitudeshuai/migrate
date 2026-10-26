@@ -30,6 +30,12 @@ type Config struct {
 	MigrationsTable string
 	DatabaseName    string
 	NoTxWrap        bool
+
+	// DropAuthorization states whether Drop is explicitly authorized for the
+	// instance. The zero value denies Drop. Open populates it from the
+	// x-drop-authorized connection parameter; set Authorized to true here when
+	// creating the driver via WithInstance.
+	DropAuthorization database.DropAuthorization
 }
 
 type Sqlite struct {
@@ -56,6 +62,9 @@ func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
 		db:     instance,
 		config: config,
 	}
+
+	config.DropAuthorization = database.NormalizeDropAuthorization(config.DropAuthorization, config.DatabaseName)
+
 	if err := mx.ensureVersionTable(); err != nil {
 		return nil, err
 	}
@@ -114,9 +123,10 @@ func (m *Sqlite) Open(url string) (database.Driver, error) {
 	}
 
 	mx, err := WithInstance(db, &Config{
-		DatabaseName:    purl.Path,
-		MigrationsTable: migrationsTable,
-		NoTxWrap:        noTxWrap,
+		DatabaseName:      purl.Path,
+		MigrationsTable:   migrationsTable,
+		NoTxWrap:          noTxWrap,
+		DropAuthorization: database.ParseDropAuthorization(qv),
 	})
 	if err != nil {
 		return nil, err
@@ -128,7 +138,18 @@ func (m *Sqlite) Close() error {
 	return m.db.Close()
 }
 
+// DropAuthorized implements database.DropAuthorizer.
+func (m *Sqlite) DropAuthorized() database.DropAuthorization {
+	return m.config.DropAuthorization
+}
+
+var _ database.DropAuthorizer = (*Sqlite)(nil)
+
 func (m *Sqlite) Drop() (err error) {
+	if err := database.RequireDropAuthorization(m.config.DropAuthorization); err != nil {
+		return err
+	}
+
 	query := `SELECT name FROM sqlite_master WHERE type = 'table';`
 	tables, err := m.db.Query(query)
 	if err != nil {

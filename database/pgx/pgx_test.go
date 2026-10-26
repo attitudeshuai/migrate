@@ -90,7 +90,7 @@ func Test(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := pgConnectionString(ip, port)
+		addr := pgConnectionString(ip, port) + "&x-drop-authorized=true"
 		p := &Postgres{}
 		d, err := p.Open(addr)
 		if err != nil {
@@ -112,7 +112,7 @@ func TestMigrate(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := pgConnectionString(ip, port)
+		addr := pgConnectionString(ip, port) + "&x-drop-authorized=true"
 		p := &Postgres{}
 		d, err := p.Open(addr)
 		if err != nil {
@@ -138,7 +138,7 @@ func TestMigrateLockTable(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := pgConnectionString(ip, port, "x-lock-strategy=table", "x-lock-table=lock_table")
+		addr := pgConnectionString(ip, port, "x-lock-strategy=table", "x-lock-table=lock_table", "x-drop-authorized=true")
 		p := &Postgres{}
 		d, err := p.Open(addr)
 		if err != nil {
@@ -630,7 +630,7 @@ func TestPostgres_Lock(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := pgConnectionString(ip, port)
+		addr := pgConnectionString(ip, port) + "&x-drop-authorized=true"
 		p := &Postgres{}
 		d, err := p.Open(addr)
 		if err != nil {

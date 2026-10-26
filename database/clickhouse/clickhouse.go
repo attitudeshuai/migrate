@@ -33,6 +33,12 @@ type Config struct {
 	MigrationsTableEngine string
 	MultiStatementEnabled bool
 	MultiStatementMaxSize int
+
+	// DropAuthorization states whether Drop is explicitly authorized for the
+	// database. The zero value denies Drop. Open populates it from the
+	// x-drop-authorized connection parameter; set Authorized to true here when
+	// creating the driver via WithInstance.
+	DropAuthorization database.DropAuthorization
 }
 
 func init() {
@@ -100,6 +106,7 @@ func (ch *ClickHouse) Open(dsn string) (database.Driver, error) {
 			ClusterName:           purl.Query().Get("x-cluster-name"),
 			MultiStatementEnabled: purl.Query().Get("x-multi-statement") == "true",
 			MultiStatementMaxSize: multiStatementMaxSize,
+			DropAuthorization:     database.ParseDropAuthorization(purl.Query()),
 		},
 	}
 
@@ -128,6 +135,8 @@ func (ch *ClickHouse) init() error {
 	if len(ch.config.MigrationsTableEngine) == 0 {
 		ch.config.MigrationsTableEngine = DefaultMigrationsTableEngine
 	}
+
+	ch.config.DropAuthorization = database.NormalizeDropAuthorization(ch.config.DropAuthorization, ch.config.DatabaseName)
 
 	return ch.ensureVersionTable()
 }
@@ -253,7 +262,18 @@ func (ch *ClickHouse) ensureVersionTable() (err error) {
 	return nil
 }
 
+// DropAuthorized implements database.DropAuthorizer.
+func (ch *ClickHouse) DropAuthorized() database.DropAuthorization {
+	return ch.config.DropAuthorization
+}
+
+var _ database.DropAuthorizer = (*ClickHouse)(nil)
+
 func (ch *ClickHouse) Drop() (err error) {
+	if err := database.RequireDropAuthorization(ch.config.DropAuthorization); err != nil {
+		return err
+	}
+
 	query := "SHOW TABLES FROM " + quoteIdentifier(ch.config.DatabaseName)
 	tables, err := ch.conn.Query(query)
 

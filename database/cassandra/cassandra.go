@@ -40,6 +40,12 @@ type Config struct {
 	KeyspaceName          string
 	MultiStatementEnabled bool
 	MultiStatementMaxSize int
+
+	// DropAuthorization states whether Drop is explicitly authorized for the
+	// keyspace. The zero value denies Drop. Open populates it from the
+	// x-drop-authorized connection parameter; set Authorized to true here when
+	// creating the driver via WithInstance.
+	DropAuthorization database.DropAuthorization
 }
 
 type Cassandra struct {
@@ -73,6 +79,8 @@ func WithInstance(session *gocql.Session, config *Config) (database.Driver, erro
 		session: session,
 		config:  config,
 	}
+
+	config.DropAuthorization = database.NormalizeDropAuthorization(config.DropAuthorization, config.KeyspaceName)
 
 	if err := c.ensureVersionTable(); err != nil {
 		return nil, err
@@ -188,6 +196,7 @@ func (c *Cassandra) Open(url string) (database.Driver, error) {
 		MigrationsTable:       u.Query().Get("x-migrations-table"),
 		MultiStatementEnabled: u.Query().Get("x-multi-statement") == "true",
 		MultiStatementMaxSize: multiStatementMaxSize,
+		DropAuthorization:     database.ParseDropAuthorization(u.Query()),
 	})
 }
 
@@ -289,7 +298,18 @@ func (c *Cassandra) Version() (version int, dirty bool, err error) {
 	}
 }
 
+// DropAuthorized implements database.DropAuthorizer.
+func (c *Cassandra) DropAuthorized() database.DropAuthorization {
+	return c.config.DropAuthorization
+}
+
+var _ database.DropAuthorizer = (*Cassandra)(nil)
+
 func (c *Cassandra) Drop() error {
+	if err := database.RequireDropAuthorization(c.config.DropAuthorization); err != nil {
+		return err
+	}
+
 	// select all tables in current schema
 	query := fmt.Sprintf(`SELECT table_name from system_schema.tables WHERE keyspace_name='%s'`, c.config.KeyspaceName)
 	iter := c.session.Query(query).Iter()

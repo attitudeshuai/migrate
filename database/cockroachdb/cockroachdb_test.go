@@ -91,7 +91,7 @@ func Test(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := fmt.Sprintf("cockroach://root@%v:%v/migrate?sslmode=disable", ip, port)
+		addr := fmt.Sprintf("cockroach://root@%v:%v/migrate?sslmode=disable&x-drop-authorized=true", ip, port)
 		c := &CockroachDb{}
 		d, err := c.Open(addr)
 		if err != nil {
@@ -110,7 +110,7 @@ func TestMigrate(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := fmt.Sprintf("cockroach://root@%v:%v/migrate?sslmode=disable", ip, port)
+		addr := fmt.Sprintf("cockroach://root@%v:%v/migrate?sslmode=disable&x-drop-authorized=true", ip, port)
 		c := &CockroachDb{}
 		d, err := c.Open(addr)
 		if err != nil {

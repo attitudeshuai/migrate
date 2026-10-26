@@ -33,6 +33,12 @@ var (
 type Config struct {
 	MigrationsTable string
 	DatabaseName    string
+
+	// DropAuthorization states whether Drop is explicitly authorized for the
+	// instance. The zero value denies Drop. Open populates it from the
+	// x-drop-authorized connection parameter; set Authorized to true here when
+	// creating the driver via WithInstance.
+	DropAuthorization database.DropAuthorization
 }
 
 type Redshift struct {
@@ -83,6 +89,8 @@ func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
 		config: config,
 	}
 
+	config.DropAuthorization = database.NormalizeDropAuthorization(config.DropAuthorization, config.DatabaseName)
+
 	if err := px.ensureVersionTable(); err != nil {
 		return nil, err
 	}
@@ -105,8 +113,9 @@ func (p *Redshift) Open(url string) (database.Driver, error) {
 	migrationsTable := purl.Query().Get("x-migrations-table")
 
 	px, err := WithInstance(db, &Config{
-		DatabaseName:    purl.Path,
-		MigrationsTable: migrationsTable,
+		DatabaseName:      purl.Path,
+		MigrationsTable:   migrationsTable,
+		DropAuthorization: database.ParseDropAuthorization(purl.Query()),
 	})
 	if err != nil {
 		return nil, err
@@ -261,7 +270,18 @@ func (p *Redshift) Version() (version int, dirty bool, err error) {
 	}
 }
 
+// DropAuthorized implements database.DropAuthorizer.
+func (p *Redshift) DropAuthorized() database.DropAuthorization {
+	return p.config.DropAuthorization
+}
+
+var _ database.DropAuthorizer = (*Redshift)(nil)
+
 func (p *Redshift) Drop() (err error) {
+	if err := database.RequireDropAuthorization(p.config.DropAuthorization); err != nil {
+		return err
+	}
+
 	// select all tables in current schema
 	query := `SELECT table_name FROM information_schema.tables WHERE table_schema=(SELECT current_schema()) AND table_type='BASE TABLE'`
 	tables, err := p.conn.QueryContext(context.Background(), query)

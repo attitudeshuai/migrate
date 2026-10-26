@@ -80,7 +80,7 @@ func test(t *testing.T) {
 		if err != nil {
 			t.Fatal("Unable to get mapped port:", err)
 		}
-		addr := fmt.Sprintf("cassandra://%v:%v/testks", ip, port)
+		addr := fmt.Sprintf("cassandra://%v:%v/testks?x-drop-authorized=true", ip, port)
 		p := &Cassandra{}
 		d, err := p.Open(addr)
 		if err != nil {
@@ -101,7 +101,7 @@ func testMigrate(t *testing.T) {
 		if err != nil {
 			t.Fatal("Unable to get mapped port:", err)
 		}
-		addr := fmt.Sprintf("cassandra://%v:%v/testks", ip, port)
+		addr := fmt.Sprintf("cassandra://%v:%v/testks?x-drop-authorized=true", ip, port)
 		p := &Cassandra{}
 		d, err := p.Open(addr)
 		if err != nil {

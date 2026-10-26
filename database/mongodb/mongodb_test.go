@@ -96,7 +96,7 @@ func test(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := mongoConnectionString(ip, port)
+		addr := mongoConnectionString(ip, port) + "&x-drop-authorized=true"
 		p := &Mongo{}
 		d, err := p.Open(addr)
 		if err != nil {
@@ -122,7 +122,7 @@ func testMigrate(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := mongoConnectionString(ip, port)
+		addr := mongoConnectionString(ip, port) + "&x-drop-authorized=true"
 		p := &Mongo{}
 		d, err := p.Open(addr)
 		if err != nil {

@@ -44,6 +44,12 @@ type Config struct {
 	MigrationsTable string
 	DatabaseName    string
 	SchemaName      string
+
+	// DropAuthorization states whether Drop is explicitly authorized for the
+	// instance. The zero value denies Drop. Open populates it from the
+	// x-drop-authorized connection parameter; set Authorized to true here when
+	// creating the driver via WithInstance.
+	DropAuthorization database.DropAuthorization
 }
 
 // SQL Server connection
@@ -113,6 +119,8 @@ func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
 		config: config,
 	}
 
+	config.DropAuthorization = database.NormalizeDropAuthorization(config.DropAuthorization, config.DatabaseName)
+
 	if err := ss.ensureVersionTable(); err != nil {
 		return nil, err
 	}
@@ -168,8 +176,9 @@ func (ss *SQLServer) Open(url string) (database.Driver, error) {
 	migrationsTable := purl.Query().Get("x-migrations-table")
 
 	px, err := WithInstance(db, &Config{
-		DatabaseName:    purl.Path,
-		MigrationsTable: migrationsTable,
+		DatabaseName:      purl.Path,
+		MigrationsTable:   migrationsTable,
+		DropAuthorization: database.ParseDropAuthorization(purl.Query()),
 	})
 
 	if err != nil {
@@ -317,8 +326,18 @@ func (ss *SQLServer) Version() (version int, dirty bool, err error) {
 	}
 }
 
+// DropAuthorized implements database.DropAuthorizer.
+func (ss *SQLServer) DropAuthorized() database.DropAuthorization {
+	return ss.config.DropAuthorization
+}
+
+var _ database.DropAuthorizer = (*SQLServer)(nil)
+
 // Drop all tables from the database.
 func (ss *SQLServer) Drop() error {
+	if err := database.RequireDropAuthorization(ss.config.DropAuthorization); err != nil {
+		return err
+	}
 
 	// drop all referential integrity constraints
 	query := `

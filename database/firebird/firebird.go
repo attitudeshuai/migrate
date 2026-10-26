@@ -31,6 +31,12 @@ var (
 type Config struct {
 	DatabaseName    string
 	MigrationsTable string
+
+	// DropAuthorization states whether Drop is explicitly authorized for the
+	// instance. The zero value denies Drop. Open populates it from the
+	// x-drop-authorized connection parameter; set Authorized to true here when
+	// creating the driver via WithInstance.
+	DropAuthorization database.DropAuthorization
 }
 
 type Firebird struct {
@@ -67,6 +73,8 @@ func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
 		config: config,
 	}
 
+	config.DropAuthorization = database.NormalizeDropAuthorization(config.DropAuthorization, config.DatabaseName)
+
 	if err := fb.ensureVersionTable(); err != nil {
 		return nil, err
 	}
@@ -86,8 +94,9 @@ func (f *Firebird) Open(dsn string) (database.Driver, error) {
 	}
 
 	px, err := WithInstance(db, &Config{
-		MigrationsTable: purl.Query().Get("x-migrations-table"),
-		DatabaseName:    purl.Path,
+		MigrationsTable:   purl.Query().Get("x-migrations-table"),
+		DatabaseName:      purl.Path,
+		DropAuthorization: database.ParseDropAuthorization(purl.Query()),
 	})
 
 	if err != nil {
@@ -171,7 +180,18 @@ func (f *Firebird) Version() (version int, dirty bool, err error) {
 	}
 }
 
+// DropAuthorized implements database.DropAuthorizer.
+func (f *Firebird) DropAuthorized() database.DropAuthorization {
+	return f.config.DropAuthorization
+}
+
+var _ database.DropAuthorizer = (*Firebird)(nil)
+
 func (f *Firebird) Drop() (err error) {
+	if err := database.RequireDropAuthorization(f.config.DropAuthorization); err != nil {
+		return err
+	}
+
 	// select all tables
 	query := `SELECT rdb$relation_name FROM rdb$relations WHERE rdb$view_blr IS NULL AND (rdb$system_flag IS NULL OR rdb$system_flag = 0);`
 	tables, err := f.conn.QueryContext(context.Background(), query)

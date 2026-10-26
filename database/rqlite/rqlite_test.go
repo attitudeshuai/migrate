@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	nurl "net/url"
 	"testing"
 
 	"github.com/dhui/dktest"
@@ -13,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database"
 	dt "github.com/golang-migrate/migrate/v4/database/testing"
 	"github.com/golang-migrate/migrate/v4/dktesting"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
@@ -78,7 +80,7 @@ func Test(t *testing.T) {
 		ip, port, err := c.Port(defaultPort)
 		assert.NoError(t, err)
 
-		connectString := fmt.Sprintf("rqlite://%s:%s?level=strong&disableClusterDiscovery=true&x-connect-insecure=true", ip, port)
+		connectString := fmt.Sprintf("rqlite://%s:%s?level=strong&disableClusterDiscovery=true&x-connect-insecure=true&x-drop-authorized=true", ip, port)
 		t.Logf("DB connect string : %s\n", connectString)
 
 		r := &Rqlite{}
@@ -94,7 +96,7 @@ func TestMigrate(t *testing.T) {
 		ip, port, err := c.Port(defaultPort)
 		assert.NoError(t, err)
 
-		connectString := fmt.Sprintf("rqlite://%s:%s?level=strong&disableClusterDiscovery=true&x-connect-insecure=true", ip, port)
+		connectString := fmt.Sprintf("rqlite://%s:%s?level=strong&disableClusterDiscovery=true&x-connect-insecure=true&x-drop-authorized=true", ip, port)
 		t.Logf("DB connect string : %s\n", connectString)
 
 		driver, err := OpenURL(connectString)
@@ -253,6 +255,14 @@ func TestMigrationTable(t *testing.T) {
 }
 
 func TestParseUrl(t *testing.T) {
+	// expectedDropAuthz builds the drop authorization conclusion parseUrl derives
+	// from the given raw query when connecting to localhost:4001.
+	expectedDropAuthz := func(rawQuery string) database.DropAuthorization {
+		query, err := nurl.ParseQuery(rawQuery)
+		assert.NoError(t, err)
+		return database.NormalizeDropAuthorization(database.ParseDropAuthorization(query), "localhost:4001")
+	}
+
 	tests := []struct {
 		name           string
 		passedUrl      string
@@ -264,21 +274,21 @@ func TestParseUrl(t *testing.T) {
 			"defaults",
 			"rqlite://localhost:4001",
 			"https://localhost:4001",
-			&Config{ConnectInsecure: DefaultConnectInsecure, MigrationsTable: DefaultMigrationsTable},
+			&Config{ConnectInsecure: DefaultConnectInsecure, MigrationsTable: DefaultMigrationsTable, DropAuthorization: expectedDropAuthz("")},
 			"",
 		},
 		{
 			"configure migration table",
 			"rqlite://localhost:4001?x-migrations-table=foo",
 			"https://localhost:4001",
-			&Config{ConnectInsecure: DefaultConnectInsecure, MigrationsTable: "foo"},
+			&Config{ConnectInsecure: DefaultConnectInsecure, MigrationsTable: "foo", DropAuthorization: expectedDropAuthz("x-migrations-table=foo")},
 			"",
 		},
 		{
 			"configure connect insecure",
 			"rqlite://localhost:4001?x-connect-insecure=true",
 			"http://localhost:4001",
-			&Config{ConnectInsecure: true, MigrationsTable: DefaultMigrationsTable},
+			&Config{ConnectInsecure: true, MigrationsTable: DefaultMigrationsTable, DropAuthorization: expectedDropAuthz("x-connect-insecure=true")},
 			"",
 		},
 		{

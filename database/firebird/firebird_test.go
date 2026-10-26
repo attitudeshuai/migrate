@@ -85,7 +85,7 @@ func Test(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := fbConnectionString(ip, port)
+		addr := fbConnectionString(ip, port) + "?x-drop-authorized=true"
 		p := &Firebird{}
 		d, err := p.Open(addr)
 		if err != nil {
@@ -107,7 +107,7 @@ func TestMigrate(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := fbConnectionString(ip, port)
+		addr := fbConnectionString(ip, port) + "?x-drop-authorized=true"
 		p := &Firebird{}
 		d, err := p.Open(addr)
 		if err != nil {
@@ -188,7 +188,7 @@ func Test_Lock(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := fbConnectionString(ip, port)
+		addr := fbConnectionString(ip, port) + "?x-drop-authorized=true"
 		p := &Firebird{}
 		d, err := p.Open(addr)
 		if err != nil {

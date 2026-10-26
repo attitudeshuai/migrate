@@ -35,7 +35,7 @@ const db = "projects/abc/instances/def/databases/testdb"
 
 func Test(t *testing.T) {
 	withSpannerEmulator(t, func(t *testing.T) {
-		uri := fmt.Sprintf("spanner://%s", db)
+		uri := fmt.Sprintf("spanner://%s?x-drop-authorized=true", db)
 		s := &Spanner{}
 		d, err := s.Open(uri)
 		if err != nil {
@@ -48,7 +48,7 @@ func Test(t *testing.T) {
 func TestMigrate(t *testing.T) {
 	withSpannerEmulator(t, func(t *testing.T) {
 		s := &Spanner{}
-		uri := fmt.Sprintf("spanner://%s", db)
+		uri := fmt.Sprintf("spanner://%s?x-drop-authorized=true", db)
 		d, err := s.Open(uri)
 		if err != nil {
 			t.Fatal(err)

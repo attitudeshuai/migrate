@@ -78,6 +78,12 @@ type Driver interface {
 	// Drop deletes everything in the database.
 	// Note that this is a breaking action, a new call to Open() is necessary to
 	// ensure subsequent calls work as expected.
+	//
+	// Drop is a destructive action and must only run after the driver reached
+	// an explicit authorization conclusion. Drivers must implement the
+	// optional DropAuthorizer interface and call RequireDropAuthorization as
+	// the first statement of Drop; a missing or malformed authorization
+	// parameter results in *DropNotAuthorizedError instead of dropping data.
 	Drop() error
 }
 

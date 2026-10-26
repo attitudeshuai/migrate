@@ -87,7 +87,7 @@ func createDB(t *testing.T, c dktest.ContainerInfo) {
 }
 
 func getConnectionString(ip, port string, options ...string) string {
-	options = append(options, "sslmode=disable")
+	options = append(options, "sslmode=disable", "x-drop-authorized=true")
 
 	return fmt.Sprintf("yugabyte://yugabyte:yugabyte@%v:%v/migrate?%s", ip, port, strings.Join(options, "&"))
 }

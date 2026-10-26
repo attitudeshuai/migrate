@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/golang-migrate/migrate/v4/database"
 	dStub "github.com/golang-migrate/migrate/v4/database/stub"
 	"github.com/golang-migrate/migrate/v4/source"
 	sStub "github.com/golang-migrate/migrate/v4/source/stub"
@@ -905,7 +906,7 @@ func TestDownDirty(t *testing.T) {
 }
 
 func TestDrop(t *testing.T) {
-	m, _ := New("stub://", "stub://")
+	m, _ := New("stub://", "stub://?"+database.DropAuthorizationParam+"=true")
 	m.sourceDrv.(*sStub.Stub).Migrations = sourceStubMigrations
 	dbDrv := m.databaseDrv.(*dStub.Stub)
 

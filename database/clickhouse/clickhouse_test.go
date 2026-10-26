@@ -11,6 +11,7 @@ import (
 	_ "github.com/ClickHouse/clickhouse-go"
 	"github.com/dhui/dktest"
 	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database"
 	"github.com/golang-migrate/migrate/v4/database/clickhouse"
 	dt "github.com/golang-migrate/migrate/v4/database/testing"
 	"github.com/golang-migrate/migrate/v4/dktesting"
@@ -90,7 +91,7 @@ func testSimple(t *testing.T, engine string) {
 			t.Fatal(err)
 		}
 
-		addr := clickhouseConnectionString(ip, port, engine)
+		addr := clickhouseConnectionString(ip, port, engine) + "&x-drop-authorized=true"
 		p := &clickhouse.ClickHouse{}
 		d, err := p.Open(addr)
 		if err != nil {
@@ -118,7 +119,7 @@ func testSimpleWithInstanceDefaultConfigValues(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		d, err := clickhouse.WithInstance(conn, &clickhouse.Config{})
+		d, err := clickhouse.WithInstance(conn, &clickhouse.Config{DropAuthorization: database.DropAuthorization{Authorized: true}})
 		if err != nil {
 			_ = conn.Close()
 			t.Fatal(err)
@@ -140,7 +141,7 @@ func testMigrate(t *testing.T, engine string) {
 			t.Fatal(err)
 		}
 
-		addr := clickhouseConnectionString(ip, port, engine)
+		addr := clickhouseConnectionString(ip, port, engine) + "&x-drop-authorized=true"
 		p := &clickhouse.ClickHouse{}
 		d, err := p.Open(addr)
 		if err != nil {
@@ -204,7 +205,7 @@ func testDrop(t *testing.T, engine string) {
 			t.Fatal(err)
 		}
 
-		addr := clickhouseConnectionString(ip, port, engine)
+		addr := clickhouseConnectionString(ip, port, engine) + "&x-drop-authorized=true"
 		p := &clickhouse.ClickHouse{}
 		d, err := p.Open(addr)
 		if err != nil {

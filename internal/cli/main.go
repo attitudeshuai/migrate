@@ -29,7 +29,8 @@ const (
 	downUsage = `down [N] [-all]    Apply all or N down migrations
 	Use -all to apply all down migrations`
 	dropUsage = `drop [-f]    Drop everything inside database
-	Use -f to bypass confirmation`
+	Use -f to bypass confirmation
+	Requires explicit authorization, e.g. x-drop-authorized=true in the -database URL`
 	forceUsage = `force V      Set version V but don't run migration (ignores dirty state)`
 )
 
@@ -303,6 +304,17 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 
 		handleSubCmdHelp(*help, dropUsage, dropFlagSet)
 
+		if migraterErr != nil {
+			log.fatalErr(migraterErr)
+		}
+
+		// Authorization is required before the confirmation prompt and is
+		// independent of -f: an unauthorized instance is never prompted about
+		// and -f cannot bypass the missing authorization.
+		if ok, err := migrater.DropAuthorized(); !ok {
+			log.fatal("Drop refused:", err)
+		}
+
 		if !*forceDrop {
 			log.Println("Are you sure you want to drop the entire database schema? [y/N]")
 			var response string
@@ -314,10 +326,6 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 			} else {
 				log.fatal("Aborted dropping the entire database schema")
 			}
-		}
-
-		if migraterErr != nil {
-			log.fatalErr(migraterErr)
 		}
 
 		if err := dropCmd(migrater); err != nil {

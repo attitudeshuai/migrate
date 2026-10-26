@@ -32,7 +32,17 @@ var (
 	ErrInvalidVersion = errors.New("version must be >= -1")
 	ErrLocked         = errors.New("database locked")
 	ErrLockTimeout    = errors.New("timeout: can't acquire database lock")
+
+	// ErrDropNotAuthorized is returned when Drop is attempted without the
+	// database instance explicitly authorizing it. Use errors.Is to detect
+	// it and errors.As to inspect the *DropNotAuthorizedError details.
+	ErrDropNotAuthorized = database.ErrDropNotAuthorized
 )
+
+// DropNotAuthorizedError is returned when Drop was rejected because the
+// database instance did not explicitly authorize dropping everything. It is
+// distinct from errors returned by a failing, but authorized, Drop.
+type DropNotAuthorizedError = database.DropNotAuthorizedError
 
 // ErrShortLimit is an error returned when not enough migrations
 // can be returned by a source for a given limit.
@@ -304,7 +314,18 @@ func (m *Migrate) Down() error {
 }
 
 // Drop deletes everything in the database.
+//
+// Drop requires explicit authorization from the database driver: the driver
+// reaches its conclusion from the connection string or its Config, and exposes
+// it through the optional database.DropAuthorizer interface. Without an
+// authorizing conclusion Drop returns *DropNotAuthorizedError before touching
+// the database; drivers not implementing DropAuthorizer are denied by default.
+// Once authorized, the lock/drop/unlock sequence is unchanged.
 func (m *Migrate) Drop() error {
+	if ok, err := m.DropAuthorized(); !ok {
+		return err
+	}
+
 	if err := m.lock(); err != nil {
 		return err
 	}
@@ -312,6 +333,34 @@ func (m *Migrate) Drop() error {
 		return m.unlockErr(err)
 	}
 	return m.unlock()
+}
+
+// DropAuthorized reports whether the database instance explicitly authorizes
+// dropping everything. When it does not, the returned error is the same
+// *DropNotAuthorizedError Drop would return, carrying the instance identifier
+// and the way to grant authorization. It performs no locking or database
+// changes and is safe to use as a pre-flight check, e.g. before an interactive
+// confirmation prompt.
+func (m *Migrate) DropAuthorized() (bool, error) {
+	authz := m.dropAuthorization()
+	if authz.Authorized {
+		return true, nil
+	}
+	return false, authz.DeniedError()
+}
+
+// dropAuthorization obtains the drop authorization conclusion from the driver.
+// Drivers not implementing the optional DropAuthorizer interface are treated
+// as unauthorized: not recognizing the interface must never allow dropping.
+func (m *Migrate) dropAuthorization() database.DropAuthorization {
+	if authorizer, ok := m.databaseDrv.(database.DropAuthorizer); ok {
+		return authorizer.DropAuthorized()
+	}
+	return database.DropAuthorization{
+		InstanceID: m.databaseDriverName,
+		Method: fmt.Sprintf("database driver %q does not implement database.DropAuthorizer; "+
+			"implement the interface to provide a drop authorization conclusion", m.databaseDriverName),
+	}
 }
 
 // Run runs any migration provided by you against the database.

@@ -48,6 +48,12 @@ type Config struct {
 	MaxRetryInterval    time.Duration
 	MaxRetryElapsedTime time.Duration
 	MaxRetries          int
+
+	// DropAuthorization states whether Drop is explicitly authorized for the
+	// instance. The zero value denies Drop. Open populates it from the
+	// x-drop-authorized connection parameter; set Authorized to true here when
+	// creating the driver via WithInstance.
+	DropAuthorization database.DropAuthorization
 }
 
 type YugabyteDB struct {
@@ -105,6 +111,8 @@ func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
 		db:     instance,
 		config: config,
 	}
+
+	config.DropAuthorization = database.NormalizeDropAuthorization(config.DropAuthorization, config.DatabaseName)
 
 	// ensureVersionTable is a locking operation, so we need to ensureLockTable before we ensureVersionTable.
 	if err := px.ensureLockTable(); err != nil {
@@ -176,6 +184,7 @@ func (c *YugabyteDB) Open(dbURL string) (database.Driver, error) {
 		MaxRetryInterval:    maxInterval,
 		MaxRetryElapsedTime: maxElapsedTime,
 		MaxRetries:          maxRetries,
+		DropAuthorization:   database.ParseDropAuthorization(purl.Query()),
 	})
 	if err != nil {
 		return nil, err
@@ -311,7 +320,18 @@ func (c *YugabyteDB) Version() (version int, dirty bool, err error) {
 	}
 }
 
+// DropAuthorized implements database.DropAuthorizer.
+func (c *YugabyteDB) DropAuthorized() database.DropAuthorization {
+	return c.config.DropAuthorization
+}
+
+var _ database.DropAuthorizer = (*YugabyteDB)(nil)
+
 func (c *YugabyteDB) Drop() (err error) {
+	if err := database.RequireDropAuthorization(c.config.DropAuthorization); err != nil {
+		return err
+	}
+
 	query := `SELECT table_name FROM information_schema.tables WHERE table_schema=(SELECT current_schema()) AND table_type='BASE TABLE'`
 	tables, err := c.db.Query(query)
 	if err != nil {

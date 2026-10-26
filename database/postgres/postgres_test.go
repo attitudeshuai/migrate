@@ -117,7 +117,7 @@ func test(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := pgConnectionString(ip, port)
+		addr := pgConnectionString(ip, port) + "&x-drop-authorized=true"
 		p := &Postgres{}
 		d, err := p.Open(addr)
 		if err != nil {
@@ -139,7 +139,7 @@ func testMigrate(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := pgConnectionString(ip, port)
+		addr := pgConnectionString(ip, port) + "&x-drop-authorized=true"
 		p := &Postgres{}
 		d, err := p.Open(addr)
 		if err != nil {
@@ -635,7 +635,7 @@ func testPostgresLock(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := pgConnectionString(ip, port)
+		addr := pgConnectionString(ip, port) + "&x-drop-authorized=true"
 		p := &Postgres{}
 		d, err := p.Open(addr)
 		if err != nil {
@@ -734,7 +734,7 @@ func testWithConnection(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		p, err := WithConnection(ctx, conn, &Config{})
+		p, err := WithConnection(ctx, conn, &Config{DropAuthorization: database.DropAuthorization{Authorized: true}})
 		if err != nil {
 			t.Fatal(err)
 		}
